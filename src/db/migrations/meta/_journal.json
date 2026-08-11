@@ -1,0 +1,62 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1783667519666,
+      "tag": "0000_first_skreet",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1783920000000,
+      "tag": "0001_auth_register",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1784095102762,
+      "tag": "0002_even_eternity",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1784102554940,
+      "tag": "0003_unusual_wolfpack",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1784189654417,
+      "tag": "0004_shiny_lady_ursula",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1784275200000,
+      "tag": "0005_drop_stale_variant_seo_fields",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1784279433677,
+      "tag": "0006_last_taskmaster",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1784716543722,
+      "tag": "0007_real_dazzler",
+      "breakpoints": true
+    }
+  ]
+}
