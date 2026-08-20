@@ -1,0 +1,390 @@
+// Prisma schema — mirrors the former Drizzle models 1:1 (tables, enums, constraints).
+// Domain ownership notes live in module services; this file is the single source of truth for Postgres.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  business_admin
+  store_manager
+  store_employee
+
+  @@map("user_role")
+}
+
+enum UserStatus {
+  invited
+  active
+  disabled
+
+  @@map("user_status")
+}
+
+enum StoreStatus {
+  onboarding
+  active
+  inactive
+  closed
+
+  @@map("store_status")
+}
+
+enum CatalogStatus {
+  draft
+  active
+  archived
+
+  @@map("catalog_status")
+}
+
+enum LedgerEntryType {
+  stock_in
+  sale
+  damage
+  return
+  adjustment
+  correction
+
+  @@map("ledger_entry_type")
+}
+
+enum NotificationType {
+  low_stock
+  qty_mismatch
+  ledger_drift
+  store_verification_pending
+
+  @@map("notification_type")
+}
+
+enum NotificationStatus {
+  pending
+  acknowledged
+  resolved
+
+  @@map("notification_status")
+}
+
+enum CustomerStatus {
+  active
+  disabled
+
+  @@map("customer_status")
+}
+
+enum OrderStatus {
+  placed
+  confirmed
+  preparing
+  out_for_delivery
+  delivered
+  cancelled
+
+  @@map("order_status")
+}
+
+// ---------------------------------------------------------------------------
+// Tenant / identity
+// ---------------------------------------------------------------------------
+
+model Business {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  users         User[]
+  catalog       MasterCatalog[]
+  stores        Store[]
+  notifications Notification[]
+  orders        Order[]
+
+  @@map("businesses")
+}
+
+model User {
+  id                       String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId               String     @map("business_id") @db.Uuid
+  // NULL for business_admin. No FK — circular with stores; app-enforced.
+  storeId                  String?    @map("store_id") @db.Uuid
+  name                     String
+  email                    String
+  passwordHash             String?    @map("password_hash")
+  phone                    String?
+  googleId                 String?    @map("google_id")
+  role                     UserRole
+  status                   UserStatus @default(invited)
+  notificationPreferences  Json       @default("{}") @map("notification_preferences")
+  createdAt                DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  business      Business         @relation(fields: [businessId], references: [id])
+  inviteTokens  InviteToken[]
+  ledgerEntries InventoryLedger[]
+  managedStores Store[]          @relation("StoreManager")
+
+  @@unique([email], map: "users_email_unique")
+  @@unique([googleId], map: "users_google_id_unique")
+  @@map("users")
+}
+
+model InviteToken {
+  id        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @map("token_hash")
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(6)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([tokenHash], map: "invite_tokens_token_hash_unique")
+  @@map("invite_tokens")
+}
+
+model Customer {
+  id           String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name         String
+  email        String
+  passwordHash String?        @map("password_hash")
+  phone        String?
+  googleId     String?        @map("google_id")
+  status       CustomerStatus @default(active)
+  createdAt    DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  carts  Cart[]
+  orders Order[]
+
+  @@unique([email], map: "customers_email_unique")
+  @@unique([googleId], map: "customers_google_id_unique")
+  @@map("customers")
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model MasterCatalog {
+  id                   String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId           String        @map("business_id") @db.Uuid
+  name                 String
+  brand                String?
+  category             String?
+  barcode              String?
+  basePrice            Decimal       @map("base_price") @db.Decimal(10, 2)
+  currency             String        @default("USD")
+  compareAtPrice       Decimal?      @map("compare_at_price") @db.Decimal(10, 2)
+  costPrice            Decimal?      @map("cost_price") @db.Decimal(10, 2)
+  taxRate              Decimal       @default(0) @map("tax_rate") @db.Decimal(5, 2)
+  allowBackorder       Boolean       @default(false) @map("allow_backorder")
+  unitOfMeasure        String        @map("unit_of_measure")
+  skuCode              String?       @map("sku_code")
+  isFragile            Boolean       @default(false) @map("is_fragile")
+  requiresColdStorage  Boolean       @default(false) @map("requires_cold_storage")
+  weightKg             Decimal?      @map("weight_kg") @db.Decimal(10, 3)
+  dimensionsCm         Json?         @map("dimensions_cm")
+  defaultReorderPoint  Int           @default(10) @map("default_reorder_point")
+  defaultInitialStock  Int?          @map("default_initial_stock")
+  images               Json          @default("[]")
+  description          String?
+  specs                Json          @default("[]")
+  variantOptions       Json          @default("[]") @map("variant_options")
+  variants             Json          @default("[]")
+  status               CatalogStatus @default(draft)
+  createdAt            DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt            DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  business      Business          @relation(fields: [businessId], references: [id])
+  storeMappings StoreSkuMapping[]
+  cartItems     CartItem[]
+  orderItems    OrderItem[]
+  notifications Notification[]
+
+  @@unique([businessId, barcode], map: "master_catalog_business_barcode_unique")
+  @@unique([businessId, skuCode], map: "master_catalog_business_sku_code_unique")
+  @@map("master_catalog")
+}
+
+// ---------------------------------------------------------------------------
+// Stores
+// ---------------------------------------------------------------------------
+
+model Store {
+  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId      String      @map("business_id") @db.Uuid
+  name            String
+  code            String?
+  address         String
+  geofence        Json
+  operatingHours  Json        @map("operating_hours")
+  facility        Json?
+  status          StoreStatus @default(onboarding)
+  managerUserId   String?     @map("manager_user_id") @db.Uuid
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  business      Business          @relation(fields: [businessId], references: [id])
+  manager       User?             @relation("StoreManager", fields: [managerUserId], references: [id])
+  skuMappings   StoreSkuMapping[]
+  notifications Notification[]
+  carts         Cart[]
+  orders        Order[]
+
+  @@map("stores")
+}
+
+model StoreSkuMapping {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  storeId          String   @map("store_id") @db.Uuid
+  skuId            String   @map("sku_id") @db.Uuid
+  priceOverride    Decimal? @map("price_override") @db.Decimal(10, 2)
+  isListed         Boolean  @default(false) @map("is_listed")
+  reorderThreshold Int      @default(10) @map("reorder_threshold")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  store    Store              @relation(fields: [storeId], references: [id])
+  sku      MasterCatalog      @relation(fields: [skuId], references: [id])
+  ledger   InventoryLedger[]
+  snapshot InventorySnapshot?
+
+  @@unique([storeId, skuId], map: "store_sku_mapping_store_sku_unique")
+  @@map("store_sku_mapping")
+}
+
+// ---------------------------------------------------------------------------
+// Inventory
+// ---------------------------------------------------------------------------
+
+model InventoryLedger {
+  id          String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  storeId     String          @map("store_id") @db.Uuid
+  skuId       String          @map("sku_id") @db.Uuid
+  type        LedgerEntryType
+  quantity    Int
+  referenceId String?         @map("reference_id") @db.Uuid
+  employeeId  String?         @map("employee_id") @db.Uuid
+  source      String?
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  mapping          StoreSkuMapping     @relation(fields: [storeId, skuId], references: [storeId, skuId], map: "inventory_ledger_store_sku_mapping_fk")
+  employee         User?               @relation(fields: [employeeId], references: [id])
+  snapshotPointers InventorySnapshot[] @relation("SnapshotLastLedger")
+
+  @@index([storeId, skuId, createdAt], map: "idx_ledger_store_sku_time")
+  @@map("inventory_ledger")
+}
+
+model InventorySnapshot {
+  storeId       String   @map("store_id") @db.Uuid
+  skuId         String   @map("sku_id") @db.Uuid
+  availableQty  Int      @default(0) @map("available_qty")
+  lastLedgerId  String?  @map("last_ledger_id") @db.Uuid
+  updatedAt     DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  mapping    StoreSkuMapping  @relation(fields: [storeId, skuId], references: [storeId, skuId], map: "inventory_snapshot_store_sku_mapping_fk")
+  lastLedger InventoryLedger? @relation("SnapshotLastLedger", fields: [lastLedgerId], references: [id])
+
+  @@id([storeId, skuId], map: "inventory_snapshot_pkey")
+  @@map("inventory_snapshot")
+}
+
+model Notification {
+  id         String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId String             @map("business_id") @db.Uuid
+  storeId    String?            @map("store_id") @db.Uuid
+  skuId      String?            @map("sku_id") @db.Uuid
+  type       NotificationType
+  payload    Json?
+  status     NotificationStatus @default(pending)
+  createdAt  DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  business Business       @relation(fields: [businessId], references: [id])
+  store    Store?         @relation(fields: [storeId], references: [id])
+  sku      MasterCatalog? @relation(fields: [skuId], references: [id])
+
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Cart / orders
+// ---------------------------------------------------------------------------
+
+model Cart {
+  id         String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customerId String   @map("customer_id") @db.Uuid
+  storeId    String   @map("store_id") @db.Uuid
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt  DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  customer Customer   @relation(fields: [customerId], references: [id])
+  store    Store      @relation(fields: [storeId], references: [id])
+  items    CartItem[]
+
+  @@map("carts")
+}
+
+model CartItem {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  cartId    String   @map("cart_id") @db.Uuid
+  skuId     String   @map("sku_id") @db.Uuid
+  quantity  Int
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  cart Cart          @relation(fields: [cartId], references: [id])
+  sku  MasterCatalog @relation(fields: [skuId], references: [id])
+
+  @@unique([cartId, skuId], map: "cart_items_cart_sku_unique")
+  @@map("cart_items")
+}
+
+model Order {
+  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  customerId      String      @map("customer_id") @db.Uuid
+  businessId      String      @map("business_id") @db.Uuid
+  storeId         String      @map("store_id") @db.Uuid
+  status          OrderStatus @default(placed)
+  deliveryAddress Json        @map("delivery_address")
+  paymentMethod   String      @map("payment_method")
+  itemsTotal      Decimal     @map("items_total") @db.Decimal(10, 2)
+  deliveryFee     Decimal     @default(0) @map("delivery_fee") @db.Decimal(10, 2)
+  handlingFee     Decimal     @default(0) @map("handling_fee") @db.Decimal(10, 2)
+  totalAmount     Decimal     @map("total_amount") @db.Decimal(10, 2)
+  riderName       String?     @map("rider_name")
+  riderPhone      String?     @map("rider_phone")
+  trackingName    String?     @map("tracking_name")
+  trackingNumber  String?     @map("tracking_number")
+  trackingUrl     String?     @map("tracking_url")
+  createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  customer Customer    @relation(fields: [customerId], references: [id])
+  business Business    @relation(fields: [businessId], references: [id])
+  store    Store       @relation(fields: [storeId], references: [id])
+  items    OrderItem[]
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id           String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  orderId      String  @map("order_id") @db.Uuid
+  skuId        String  @map("sku_id") @db.Uuid
+  nameSnapshot String  @map("name_snapshot")
+  unitPrice    Decimal @map("unit_price") @db.Decimal(10, 2)
+  quantity     Int
+  lineTotal    Decimal @map("line_total") @db.Decimal(10, 2)
+
+  order Order         @relation(fields: [orderId], references: [id])
+  sku   MasterCatalog @relation(fields: [skuId], references: [id])
+
+  @@map("order_items")
+}

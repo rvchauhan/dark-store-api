@@ -1,9 +1,7 @@
 import { randomBytes, createHash } from "node:crypto";
-import { eq } from "drizzle-orm";
 import bcrypt from "bcryptjs";
-import { db } from "../../db/client.js";
-import { businesses, users, inviteTokens } from "../../db/schema/tenant.js";
-import { stores } from "../../db/schema/store.js";
+import type { User } from "@prisma/client";
+import { prisma } from "../../db/client.js";
 import { env } from "../../config/env.js";
 import { AppError } from "../../shared/errors/app-error.js";
 import { signAccessToken } from "../../shared/auth/jwt.js";
@@ -30,7 +28,7 @@ const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
  */
 export class AuthService {
   async login(input: LoginInput) {
-    const [user] = await db.select().from(users).where(eq(users.email, input.email)).limit(1);
+    const user = await prisma.user.findUnique({ where: { email: input.email } });
 
     if (!user || user.status !== "active") {
       throw new AppError(401, "Invalid email or password", "INVALID_CREDENTIALS");
@@ -61,7 +59,7 @@ export class AuthService {
   async register(input: RegisterInput) {
     const email = input.email.trim().toLowerCase();
 
-    const [existing] = await db.select().from(users).where(eq(users.email, email)).limit(1);
+    const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
       throw new AppError(409, "An account with this email already exists", "EMAIL_TAKEN");
     }
@@ -69,12 +67,11 @@ export class AuthService {
     const passwordHash = await bcrypt.hash(input.password, 10);
     const businessName = `${input.fullName.trim()}'s Business`;
 
-    const user = await db.transaction(async (tx) => {
-      const [business] = await tx.insert(businesses).values({ name: businessName }).returning();
+    const user = await prisma.$transaction(async (tx) => {
+      const business = await tx.business.create({ data: { name: businessName } });
 
-      const [created] = await tx
-        .insert(users)
-        .values({
+      return tx.user.create({
+        data: {
           businessId: business.id,
           storeId: null,
           name: input.fullName.trim(),
@@ -83,10 +80,8 @@ export class AuthService {
           passwordHash,
           role: "business_admin",
           status: "active",
-        })
-        .returning();
-
-      return created;
+        },
+      });
     });
 
     return this.issueSession(user);
@@ -110,8 +105,7 @@ export class AuthService {
       throw new AppError(401, "Invalid Google token audience", "INVALID_GOOGLE_TOKEN");
     }
 
-    const emailVerified =
-      profile.email_verified === true || profile.email_verified === "true";
+    const emailVerified = profile.email_verified === true || profile.email_verified === "true";
     if (!emailVerified) {
       throw new AppError(401, "Google email is not verified", "GOOGLE_EMAIL_UNVERIFIED");
     }
@@ -119,10 +113,9 @@ export class AuthService {
     const email = profile.email.trim().toLowerCase();
 
     // Prefer lookup by googleId, then by email (link existing password account)
-    let [user] = await db.select().from(users).where(eq(users.googleId, profile.sub)).limit(1);
-
+    let user = await prisma.user.findUnique({ where: { googleId: profile.sub } });
     if (!user) {
-      [user] = await db.select().from(users).where(eq(users.email, email)).limit(1);
+      user = await prisma.user.findUnique({ where: { email } });
     }
 
     if (user) {
@@ -132,12 +125,10 @@ export class AuthService {
 
       // Link Google subject if this was originally a password account
       if (!user.googleId) {
-        const [updated] = await db
-          .update(users)
-          .set({ googleId: profile.sub })
-          .where(eq(users.id, user.id))
-          .returning();
-        user = updated;
+        user = await prisma.user.update({
+          where: { id: user.id },
+          data: { googleId: profile.sub },
+        });
       }
 
       return this.issueSession(user);
@@ -145,15 +136,13 @@ export class AuthService {
 
     // First-time Google signup
     const displayName = profile.name?.trim() || email.split("@")[0];
-    const created = await db.transaction(async (tx) => {
-      const [business] = await tx
-        .insert(businesses)
-        .values({ name: `${displayName}'s Business` })
-        .returning();
+    const created = await prisma.$transaction(async (tx) => {
+      const business = await tx.business.create({
+        data: { name: `${displayName}'s Business` },
+      });
 
-      const [row] = await tx
-        .insert(users)
-        .values({
+      return tx.user.create({
+        data: {
           businessId: business.id,
           storeId: null,
           name: displayName,
@@ -162,10 +151,8 @@ export class AuthService {
           passwordHash: null,
           role: "business_admin",
           status: "active",
-        })
-        .returning();
-
-      return row;
+        },
+      });
     });
 
     return this.issueSession(created);
@@ -185,7 +172,7 @@ export class AuthService {
    * (the wizard shows it as a copyable setup link).
    */
   async inviteManager(auth: AuthUser, input: InviteManagerInput) {
-    const [store] = await db.select().from(stores).where(eq(stores.id, input.storeId)).limit(1);
+    const store = await prisma.store.findUnique({ where: { id: input.storeId } });
     if (!store || store.businessId !== auth.businessId) {
       throw new AppError(404, "Store not found", "NOT_FOUND");
     }
@@ -193,24 +180,21 @@ export class AuthService {
     const email = input.email.trim().toLowerCase();
     const name = input.name.trim();
 
-    const [existing] = await db.select().from(users).where(eq(users.email, email)).limit(1);
+    const existing = await prisma.user.findUnique({ where: { email } });
 
-    let user: typeof users.$inferSelect;
+    let user: User;
     if (existing) {
       if (existing.businessId !== auth.businessId) {
         throw new AppError(409, "An account with this email already exists", "EMAIL_TAKEN");
       }
       // Re-invite: reassign to this store and reset to invited (does not touch an active password).
-      const [updated] = await db
-        .update(users)
-        .set({ name, storeId: input.storeId, role: "store_manager", status: "invited" })
-        .where(eq(users.id, existing.id))
-        .returning();
-      user = updated;
+      user = await prisma.user.update({
+        where: { id: existing.id },
+        data: { name, storeId: input.storeId, role: "store_manager", status: "invited" },
+      });
     } else {
-      const [created] = await db
-        .insert(users)
-        .values({
+      user = await prisma.user.create({
+        data: {
           businessId: auth.businessId,
           storeId: input.storeId,
           name,
@@ -218,25 +202,23 @@ export class AuthService {
           passwordHash: null,
           role: "store_manager",
           status: "invited",
-        })
-        .returning();
-      user = created;
+        },
+      });
     }
 
-    await db
-      .update(stores)
-      .set({ managerUserId: user.id, updatedAt: new Date() })
-      .where(eq(stores.id, input.storeId));
+    await prisma.store.update({
+      where: { id: input.storeId },
+      data: { managerUserId: user.id },
+    });
 
     const rawToken = randomBytes(32).toString("hex");
-    const [invite] = await db
-      .insert(inviteTokens)
-      .values({
+    const invite = await prisma.inviteToken.create({
+      data: {
         userId: user.id,
         tokenHash: this.hashToken(rawToken),
         expiresAt: new Date(Date.now() + INVITE_TTL_MS),
-      })
-      .returning();
+      },
+    });
 
     const inviteLink = `${env.PORTAL_URL}/set-password?token=${rawToken}`;
     const emailSent = await sendManagerInviteEmail({ to: user.email, name: user.name, inviteLink });
@@ -253,7 +235,7 @@ export class AuthService {
   /** Public — lets the set-password page greet the invitee before they submit. */
   async getInvite(rawToken: string) {
     const invite = await this.resolveInvite(rawToken);
-    const [user] = await db.select().from(users).where(eq(users.id, invite.userId)).limit(1);
+    const user = await prisma.user.findUnique({ where: { id: invite.userId } });
     if (!user) {
       throw new AppError(404, "Invite not found", "NOT_FOUND");
     }
@@ -265,14 +247,16 @@ export class AuthService {
     const invite = await this.resolveInvite(input.token);
     const passwordHash = await bcrypt.hash(input.password, 10);
 
-    const user = await db.transaction(async (tx) => {
-      const [updated] = await tx
-        .update(users)
-        .set({ passwordHash, status: "active" })
-        .where(eq(users.id, invite.userId))
-        .returning();
+    const user = await prisma.$transaction(async (tx) => {
+      const updated = await tx.user.update({
+        where: { id: invite.userId },
+        data: { passwordHash, status: "active" },
+      });
 
-      await tx.update(inviteTokens).set({ usedAt: new Date() }).where(eq(inviteTokens.id, invite.id));
+      await tx.inviteToken.update({
+        where: { id: invite.id },
+        data: { usedAt: new Date() },
+      });
 
       return updated;
     });
@@ -282,7 +266,7 @@ export class AuthService {
 
   /** Self-serve password change for a logged-in user. */
   async changePassword(auth: AuthUser, input: ChangePasswordInput) {
-    const [user] = await db.select().from(users).where(eq(users.id, auth.userId)).limit(1);
+    const user = await prisma.user.findUnique({ where: { id: auth.userId } });
     if (!user) {
       throw new AppError(404, "User not found", "NOT_FOUND");
     }
@@ -301,17 +285,19 @@ export class AuthService {
     }
 
     const passwordHash = await bcrypt.hash(input.newPassword, 10);
-    await db.update(users).set({ passwordHash }).where(eq(users.id, auth.userId));
+    await prisma.user.update({
+      where: { id: auth.userId },
+      data: { passwordHash },
+    });
 
     return { success: true };
   }
 
   async getNotificationPreferences(auth: AuthUser) {
-    const [user] = await db
-      .select({ notificationPreferences: users.notificationPreferences })
-      .from(users)
-      .where(eq(users.id, auth.userId))
-      .limit(1);
+    const user = await prisma.user.findUnique({
+      where: { id: auth.userId },
+      select: { notificationPreferences: true },
+    });
     if (!user) {
       throw new AppError(404, "User not found", "NOT_FOUND");
     }
@@ -323,11 +309,11 @@ export class AuthService {
     const existing = await this.getNotificationPreferences(auth);
     const merged = { ...existing, ...input };
 
-    const [updated] = await db
-      .update(users)
-      .set({ notificationPreferences: merged })
-      .where(eq(users.id, auth.userId))
-      .returning({ notificationPreferences: users.notificationPreferences });
+    const updated = await prisma.user.update({
+      where: { id: auth.userId },
+      data: { notificationPreferences: merged },
+      select: { notificationPreferences: true },
+    });
 
     return updated.notificationPreferences as Record<string, boolean>;
   }
@@ -341,11 +327,9 @@ export class AuthService {
   }
 
   private async resolveInvite(rawToken: string) {
-    const [invite] = await db
-      .select()
-      .from(inviteTokens)
-      .where(eq(inviteTokens.tokenHash, this.hashToken(rawToken)))
-      .limit(1);
+    const invite = await prisma.inviteToken.findUnique({
+      where: { tokenHash: this.hashToken(rawToken) },
+    });
 
     if (!invite || invite.usedAt || invite.expiresAt < new Date()) {
       throw new AppError(400, "This invite link is invalid or has expired", "INVALID_INVITE");
@@ -354,7 +338,7 @@ export class AuthService {
     return invite;
   }
 
-  private issueSession(user: typeof users.$inferSelect) {
+  private issueSession(user: User) {
     const authUser: AuthUser = {
       userId: user.id,
       businessId: user.businessId,

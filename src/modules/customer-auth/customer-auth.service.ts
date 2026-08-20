@@ -1,7 +1,6 @@
-import { eq } from "drizzle-orm";
 import bcrypt from "bcryptjs";
-import { db } from "../../db/client.js";
-import { customers } from "../../db/schema/customer.js";
+import type { Customer } from "@prisma/client";
+import { prisma } from "../../db/client.js";
 import { env } from "../../config/env.js";
 import { AppError } from "../../shared/errors/app-error.js";
 import { signAccessToken } from "../../shared/auth/jwt.js";
@@ -17,11 +16,9 @@ import type { CustomerAuthUser } from "../../shared/types/customer-auth.js";
  */
 export class CustomerAuthService {
   async login(input: CustomerLoginInput) {
-    const [customer] = await db
-      .select()
-      .from(customers)
-      .where(eq(customers.email, input.email.trim().toLowerCase()))
-      .limit(1);
+    const customer = await prisma.customer.findUnique({
+      where: { email: input.email.trim().toLowerCase() },
+    });
 
     if (!customer || customer.status !== "active") {
       throw new AppError(401, "Invalid email or password", "INVALID_CREDENTIALS");
@@ -46,23 +43,22 @@ export class CustomerAuthService {
   async register(input: CustomerRegisterInput) {
     const email = input.email.trim().toLowerCase();
 
-    const [existing] = await db.select().from(customers).where(eq(customers.email, email)).limit(1);
+    const existing = await prisma.customer.findUnique({ where: { email } });
     if (existing) {
       throw new AppError(409, "An account with this email already exists", "EMAIL_TAKEN");
     }
 
     const passwordHash = await bcrypt.hash(input.password, 10);
 
-    const [created] = await db
-      .insert(customers)
-      .values({
+    const created = await prisma.customer.create({
+      data: {
         name: input.name.trim(),
         email,
         phone: input.phone?.trim() || null,
         passwordHash,
         status: "active",
-      })
-      .returning();
+      },
+    });
 
     return this.issueSession(created);
   }
@@ -88,9 +84,9 @@ export class CustomerAuthService {
 
     const email = profile.email.trim().toLowerCase();
 
-    let [customer] = await db.select().from(customers).where(eq(customers.googleId, profile.sub)).limit(1);
+    let customer = await prisma.customer.findUnique({ where: { googleId: profile.sub } });
     if (!customer) {
-      [customer] = await db.select().from(customers).where(eq(customers.email, email)).limit(1);
+      customer = await prisma.customer.findUnique({ where: { email } });
     }
 
     if (customer) {
@@ -99,28 +95,25 @@ export class CustomerAuthService {
       }
 
       if (!customer.googleId) {
-        const [updated] = await db
-          .update(customers)
-          .set({ googleId: profile.sub })
-          .where(eq(customers.id, customer.id))
-          .returning();
-        customer = updated;
+        customer = await prisma.customer.update({
+          where: { id: customer.id },
+          data: { googleId: profile.sub },
+        });
       }
 
       return this.issueSession(customer);
     }
 
     const displayName = profile.name?.trim() || email.split("@")[0];
-    const [created] = await db
-      .insert(customers)
-      .values({
+    const created = await prisma.customer.create({
+      data: {
         name: displayName,
         email,
         googleId: profile.sub,
         passwordHash: null,
         status: "active",
-      })
-      .returning();
+      },
+    });
 
     return this.issueSession(created);
   }
@@ -130,7 +123,7 @@ export class CustomerAuthService {
     return { customer: auth };
   }
 
-  private issueSession(customer: typeof customers.$inferSelect) {
+  private issueSession(customer: Customer) {
     const authUser: CustomerAuthUser = {
       customerId: customer.id,
       email: customer.email,

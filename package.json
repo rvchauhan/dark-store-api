@@ -3,33 +3,42 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc",
+    "build": "prisma generate && tsc",
     "start": "node dist/index.js",
-    "db:generate": "drizzle-kit generate",
-    "db:migrate": "tsx src/db/migrate.ts",
+    "postinstall": "prisma generate",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate deploy",
+    "db:migrate:dev": "prisma migrate dev",
     "db:seed": "tsx src/db/seed.ts",
-    "db:setup": "npm run db:migrate && npm run db:seed",
+    "db:restore-local": "tsx src/db/restore-from-local.ts",
+    "db:ensure-accounts": "tsx src/db/ensure-yopmail-accounts.ts",
+    "db:setup": "npm run db:migrate",
     "db:reset": "docker compose down -v && docker compose up -d --wait && npm run db:setup",
-    "db:studio": "drizzle-kit studio"
+    "db:studio": "prisma studio"
   },
   "dependencies": {
+    "@prisma/client": "^6.19.3",
+    "@types/pg": "^8.21.0",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
-    "drizzle-orm": "^0.45.2",
     "express": "^5.1.0",
-    "pg": "^8.22.0",
+    "pg": "^8.23.0",
     "resend": "^6.17.2",
+    "swagger-ui-express": "^5.0.1",
     "zod": "^3.24.2"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.3",
     "@types/node": "^22.16.5",
-    "@types/pg": "^8.20.0",
-    "drizzle-kit": "^0.31.10",
+    "@types/swagger-ui-express": "^4.1.8",
+    "prisma": "^6.19.3",
     "tsx": "^4.23.0",
     "typescript": "^5.8.3"
   }

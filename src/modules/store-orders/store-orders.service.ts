@@ -1,13 +1,10 @@
-import { and, asc, count, eq, gte, inArray, ne, or, sum } from "drizzle-orm";
-import { db } from "../../db/client.js";
-import { orders, orderItems } from "../../db/schema/order.js";
-import { customers } from "../../db/schema/customer.js";
-import { masterCatalog } from "../../db/schema/catalog.js";
+import type { OrderStatus } from "@prisma/client";
+import { prisma } from "../../db/client.js";
 import { AppError } from "../../shared/errors/app-error.js";
 import type { AuthUser } from "../../shared/types/auth.js";
-import type { ListOrdersQuery } from "./store-orders.schemas.js";
+import type { ListOrdersQuery, UpdateOrderStatusInput } from "./store-orders.schemas.js";
 
-const ACTIVE_STATUSES = ["placed", "confirmed", "preparing", "out_for_delivery"] as const;
+const ACTIVE_STATUSES: OrderStatus[] = ["placed", "confirmed", "preparing", "out_for_delivery"];
 
 /** Forward-only transitions; anything can be cancelled except a terminal order. */
 const ALLOWED_TRANSITIONS: Record<string, string[]> = {
@@ -29,43 +26,36 @@ export class StoreOrdersService {
   async listOrders(auth: AuthUser, storeId: string, query: ListOrdersQuery) {
     void auth;
 
-    const conditions = [eq(orders.storeId, storeId)];
-    if (query.status === "active") {
-      conditions.push(inArray(orders.status, ACTIVE_STATUSES));
-    }
-
-    const rows = await db
-      .select({
-        id: orders.id,
-        status: orders.status,
-        paymentMethod: orders.paymentMethod,
-        itemsTotal: orders.itemsTotal,
-        totalAmount: orders.totalAmount,
-        createdAt: orders.createdAt,
-        updatedAt: orders.updatedAt,
-        customerName: customers.name,
-      })
-      .from(orders)
-      .innerJoin(customers, eq(customers.id, orders.customerId))
-      .where(and(...conditions))
-      .orderBy(asc(orders.createdAt));
+    const rows = await prisma.order.findMany({
+      where: {
+        storeId,
+        ...(query.status === "active" ? { status: { in: ACTIVE_STATUSES } } : {}),
+      },
+      include: { customer: { select: { name: true } } },
+      orderBy: { createdAt: "asc" },
+    });
 
     if (rows.length === 0) return [];
 
-    const itemCounts = await db
-      .select({ orderId: orderItems.orderId, count: count() })
-      .from(orderItems)
-      .where(
-        inArray(
-          orderItems.orderId,
-          rows.map((r) => r.id),
-        ),
-      )
-      .groupBy(orderItems.orderId);
+    const itemCounts = await prisma.orderItem.groupBy({
+      by: ["orderId"],
+      where: { orderId: { in: rows.map((r) => r.id) } },
+      _count: { _all: true },
+    });
 
-    const countByOrder = new Map(itemCounts.map((c) => [c.orderId, Number(c.count)]));
+    const countByOrder = new Map(itemCounts.map((c) => [c.orderId, c._count._all]));
 
-    return rows.map((row) => ({ ...row, itemCount: countByOrder.get(row.id) ?? 0 }));
+    return rows.map((row) => ({
+      id: row.id,
+      status: row.status,
+      paymentMethod: row.paymentMethod,
+      itemsTotal: row.itemsTotal,
+      totalAmount: row.totalAmount,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      customerName: row.customer.name,
+      itemCount: countByOrder.get(row.id) ?? 0,
+    }));
   }
 
   async getStats(auth: AuthUser, storeId: string) {
@@ -78,107 +68,120 @@ export class StoreOrdersService {
     // over — it's still in-flight revenue until delivery closes it out. Count
     // it under whichever day that happens, not the day it was merely placed,
     // or its revenue never lands in any day's total.
-    const touchedToday = and(
-      eq(orders.storeId, storeId),
-      ne(orders.status, "cancelled"),
-      or(
-        gte(orders.createdAt, todayStart),
-        and(eq(orders.status, "delivered"), gte(orders.updatedAt, todayStart)),
-      ),
-    );
+    const touchedToday = {
+      storeId,
+      status: { not: "cancelled" as const },
+      OR: [
+        { createdAt: { gte: todayStart } },
+        { status: "delivered" as const, updatedAt: { gte: todayStart } },
+      ],
+    };
 
-    const [todayRow] = await db.select({ count: count() }).from(orders).where(touchedToday);
-
-    const [activeRow] = await db
-      .select({ count: count() })
-      .from(orders)
-      .where(and(eq(orders.storeId, storeId), inArray(orders.status, ACTIVE_STATUSES)));
-
-    const [revenueRow] = await db
-      .select({ total: sum(orders.totalAmount) })
-      .from(orders)
-      .where(touchedToday);
+    const [todayCount, activeCount, revenueAgg] = await Promise.all([
+      prisma.order.count({ where: touchedToday }),
+      prisma.order.count({
+        where: { storeId, status: { in: ACTIVE_STATUSES } },
+      }),
+      prisma.order.aggregate({
+        where: touchedToday,
+        _sum: { totalAmount: true },
+      }),
+    ]);
 
     return {
-      todayCount: Number(todayRow?.count ?? 0),
-      activeCount: Number(activeRow?.count ?? 0),
-      todayRevenue: Number(revenueRow?.total ?? 0),
+      todayCount,
+      activeCount,
+      todayRevenue: Number(revenueAgg._sum.totalAmount ?? 0),
     };
   }
 
   async getOrder(auth: AuthUser, storeId: string, orderId: string) {
     void auth;
 
-    const [order] = await db
-      .select({
-        id: orders.id,
-        storeId: orders.storeId,
-        status: orders.status,
-        deliveryAddress: orders.deliveryAddress,
-        paymentMethod: orders.paymentMethod,
-        itemsTotal: orders.itemsTotal,
-        deliveryFee: orders.deliveryFee,
-        handlingFee: orders.handlingFee,
-        totalAmount: orders.totalAmount,
-        riderName: orders.riderName,
-        riderPhone: orders.riderPhone,
-        trackingName: orders.trackingName,
-        trackingNumber: orders.trackingNumber,
-        trackingUrl: orders.trackingUrl,
-        createdAt: orders.createdAt,
-        updatedAt: orders.updatedAt,
-        customerName: customers.name,
-        customerPhone: customers.phone,
-      })
-      .from(orders)
-      .innerJoin(customers, eq(customers.id, orders.customerId))
-      .where(eq(orders.id, orderId))
-      .limit(1);
+    const orderRow = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: {
+        customer: { select: { name: true, phone: true } },
+      },
+    });
 
-    if (!order || order.storeId !== storeId) {
+    if (!orderRow || orderRow.storeId !== storeId) {
       throw new AppError(404, "Order not found", "NOT_FOUND");
     }
 
-    const items = await db
-      .select({
-        id: orderItems.id,
-        orderId: orderItems.orderId,
-        skuId: orderItems.skuId,
-        nameSnapshot: orderItems.nameSnapshot,
-        unitPrice: orderItems.unitPrice,
-        quantity: orderItems.quantity,
-        lineTotal: orderItems.lineTotal,
-        brand: masterCatalog.brand,
-        category: masterCatalog.category,
-        images: masterCatalog.images,
-        description: masterCatalog.description,
-        isFragile: masterCatalog.isFragile,
-        requiresColdStorage: masterCatalog.requiresColdStorage,
-        weightKg: masterCatalog.weightKg,
-        dimensionsCm: masterCatalog.dimensionsCm,
-        barcode: masterCatalog.barcode,
-        skuCode: masterCatalog.skuCode,
-        specs: masterCatalog.specs,
-      })
-      .from(orderItems)
-      // left join: an order must still render its picking list even if the
-      // SKU was later archived/deleted from the catalog.
-      .leftJoin(masterCatalog, eq(masterCatalog.id, orderItems.skuId))
-      .where(eq(orderItems.orderId, orderId));
+    const order = {
+      id: orderRow.id,
+      storeId: orderRow.storeId,
+      status: orderRow.status,
+      deliveryAddress: orderRow.deliveryAddress,
+      paymentMethod: orderRow.paymentMethod,
+      itemsTotal: orderRow.itemsTotal,
+      deliveryFee: orderRow.deliveryFee,
+      handlingFee: orderRow.handlingFee,
+      totalAmount: orderRow.totalAmount,
+      riderName: orderRow.riderName,
+      riderPhone: orderRow.riderPhone,
+      trackingName: orderRow.trackingName,
+      trackingNumber: orderRow.trackingNumber,
+      trackingUrl: orderRow.trackingUrl,
+      createdAt: orderRow.createdAt,
+      updatedAt: orderRow.updatedAt,
+      customerName: orderRow.customer.name,
+      customerPhone: orderRow.customer.phone,
+    };
 
-    return { order, items };
+    const items = await prisma.orderItem.findMany({
+      where: { orderId },
+      include: {
+        // left join semantics: keep line items even if the SKU was later removed
+        sku: {
+          select: {
+            brand: true,
+            category: true,
+            images: true,
+            description: true,
+            isFragile: true,
+            requiresColdStorage: true,
+            weightKg: true,
+            dimensionsCm: true,
+            barcode: true,
+            skuCode: true,
+            specs: true,
+          },
+        },
+      },
+    });
+
+    return {
+      order,
+      items: items.map((item) => ({
+        id: item.id,
+        orderId: item.orderId,
+        skuId: item.skuId,
+        nameSnapshot: item.nameSnapshot,
+        unitPrice: item.unitPrice,
+        quantity: item.quantity,
+        lineTotal: item.lineTotal,
+        brand: item.sku?.brand ?? null,
+        category: item.sku?.category ?? null,
+        images: item.sku?.images ?? null,
+        description: item.sku?.description ?? null,
+        isFragile: item.sku?.isFragile ?? null,
+        requiresColdStorage: item.sku?.requiresColdStorage ?? null,
+        weightKg: item.sku?.weightKg ?? null,
+        dimensionsCm: item.sku?.dimensionsCm ?? null,
+        barcode: item.sku?.barcode ?? null,
+        skuCode: item.sku?.skuCode ?? null,
+        specs: item.sku?.specs ?? null,
+      })),
+    };
   }
 
-  async updateStatus(
-    auth: AuthUser,
-    storeId: string,
-    orderId: string,
-    input: { status: string; riderName?: string; riderPhone?: string },
-  ) {
+  async updateStatus(auth: AuthUser, storeId: string, orderId: string, input: UpdateOrderStatusInput) {
     void auth;
     const { status } = input;
 
-    const [order] = await db.select().from(orders).where(eq(orders.id, orderId)).limit(1);
+    const order = await prisma.order.findUnique({ where: { id: orderId } });
     if (!order || order.storeId !== storeId) {
       throw new AppError(404, "Order not found", "NOT_FOUND");
     }
@@ -208,23 +211,17 @@ export class StoreOrdersService {
       );
     }
 
-    const [updated] = await db
-      .update(orders)
-      // Drizzle's pgEnum column type narrows to the enum union; `status` here is
-      // already validated against the same enum by updateOrderStatusSchema.
-      .set({
-        status: status as (typeof orders.$inferInsert)["status"],
+    return prisma.order.update({
+      where: { id: orderId },
+      data: {
+        status,
         ...(riderName !== undefined ? { riderName } : {}),
         ...(riderPhone !== undefined ? { riderPhone } : {}),
         ...(trackingName !== undefined ? { trackingName } : {}),
         ...(trackingNumber !== undefined ? { trackingNumber } : {}),
         ...(trackingUrl !== undefined ? { trackingUrl } : {}),
-        updatedAt: new Date(),
-      })
-      .where(eq(orders.id, orderId))
-      .returning();
-
-    return updated;
+      },
+    });
   }
 }
 

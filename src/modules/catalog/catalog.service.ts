@@ -1,8 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { and, desc, eq, ilike, isNotNull, notExists, or, sql } from "drizzle-orm";
-import { db } from "../../db/client.js";
-import { masterCatalog } from "../../db/schema/catalog.js";
-import { storeSkuMapping } from "../../db/schema/store.js";
+import type { CatalogStatus, Prisma } from "@prisma/client";
+import { prisma } from "../../db/client.js";
+import { asUniqueViolation, uniqueHit } from "../../db/prisma-helpers.js";
 import { AppError } from "../../shared/errors/app-error.js";
 import type { AuthUser } from "../../shared/types/auth.js";
 import type { CreateSkuInput, ListSkusQuery, UpdateSkuInput } from "./catalog.schemas.js";
@@ -17,22 +16,6 @@ import type { CreateSkuInput, ListSkusQuery, UpdateSkuInput } from "./catalog.sc
  *
  * Future split: deploy as catalog-service with POST/GET /catalog/skus endpoints.
  */
-
-type PgError = { code?: string; constraint?: string };
-
-/**
- * drizzle-orm ≥0.44 wraps driver errors in DrizzleQueryError with the pg error
- * on `cause`, so unwrap before checking for a unique violation (23505).
- */
-function asUniqueViolation(err: unknown): PgError | null {
-  let current: unknown = err;
-  for (let depth = 0; depth < 3 && typeof current === "object" && current !== null; depth++) {
-    const candidate = current as PgError & { cause?: unknown };
-    if (candidate.code === "23505") return candidate;
-    current = candidate.cause;
-  }
-  return null;
-}
 
 function generateSkuCode(): string {
   // 6 chars from an unambiguous alphabet (no 0/O/1/I)
@@ -53,9 +36,8 @@ export class CatalogService {
     for (let attempt = 0; ; attempt++) {
       const skuCode = input.skuCode ?? generateSkuCode();
       try {
-        const [sku] = await db
-          .insert(masterCatalog)
-          .values({
+        const sku = await prisma.masterCatalog.create({
+          data: {
             businessId: auth.businessId,
             name: input.name,
             brand: input.brand,
@@ -72,24 +54,24 @@ export class CatalogService {
             isFragile: input.isFragile,
             requiresColdStorage: input.requiresColdStorage,
             weightKg: input.weightKg?.toFixed(3),
-            dimensionsCm: input.dimensionsCm,
+            dimensionsCm: input.dimensionsCm as Prisma.InputJsonValue | undefined,
             defaultReorderPoint: input.defaultReorderPoint,
             defaultInitialStock: input.defaultInitialStock,
-            variantOptions: input.variantOptions,
-            variants: input.variants,
-            images: input.images,
+            variantOptions: input.variantOptions as Prisma.InputJsonValue,
+            variants: input.variants as Prisma.InputJsonValue,
+            images: input.images as Prisma.InputJsonValue,
             description: input.description,
-            specs: input.specs,
+            specs: input.specs as Prisma.InputJsonValue,
             status: input.status,
-          })
-          .returning();
+          },
+        });
 
         // MVP "event": sku.created — in-process only until we add a message bus
         return sku;
       } catch (err: unknown) {
         const violation = asUniqueViolation(err);
         if (violation) {
-          if (violation.constraint === "master_catalog_business_sku_code_unique") {
+          if (uniqueHit(violation, "skuCode", "sku_code")) {
             if (generateCode && attempt < SKU_CODE_RETRIES) continue;
             throw new AppError(409, "SKU code already exists in this catalog", "DUPLICATE_SKU_CODE");
           }
@@ -105,49 +87,45 @@ export class CatalogService {
     await this.getSku(auth, skuId);
 
     try {
-      const [updated] = await db
-        .update(masterCatalog)
-        .set({
-          ...(input.name !== undefined ? { name: input.name } : {}),
-          ...(input.brand !== undefined ? { brand: input.brand } : {}),
-          ...(input.category !== undefined ? { category: input.category } : {}),
-          ...(input.barcode !== undefined ? { barcode: input.barcode } : {}),
-          ...(input.basePrice !== undefined ? { basePrice: input.basePrice.toFixed(2) } : {}),
-          ...(input.currency !== undefined ? { currency: input.currency } : {}),
-          ...(input.compareAtPrice !== undefined ? { compareAtPrice: input.compareAtPrice.toFixed(2) } : {}),
-          ...(input.costPrice !== undefined ? { costPrice: input.costPrice.toFixed(2) } : {}),
-          ...(input.taxRate !== undefined ? { taxRate: input.taxRate.toFixed(2) } : {}),
-          ...(input.allowBackorder !== undefined ? { allowBackorder: input.allowBackorder } : {}),
-          ...(input.unitOfMeasure !== undefined ? { unitOfMeasure: input.unitOfMeasure } : {}),
-          ...(input.skuCode !== undefined ? { skuCode: input.skuCode } : {}),
-          ...(input.isFragile !== undefined ? { isFragile: input.isFragile } : {}),
-          ...(input.requiresColdStorage !== undefined
-            ? { requiresColdStorage: input.requiresColdStorage }
-            : {}),
-          ...(input.weightKg !== undefined ? { weightKg: input.weightKg.toFixed(3) } : {}),
-          ...(input.dimensionsCm !== undefined ? { dimensionsCm: input.dimensionsCm } : {}),
-          ...(input.defaultReorderPoint !== undefined
-            ? { defaultReorderPoint: input.defaultReorderPoint }
-            : {}),
-          ...(input.defaultInitialStock !== undefined
-            ? { defaultInitialStock: input.defaultInitialStock }
-            : {}),
-          ...(input.variantOptions !== undefined ? { variantOptions: input.variantOptions } : {}),
-          ...(input.variants !== undefined ? { variants: input.variants } : {}),
-          ...(input.images !== undefined ? { images: input.images } : {}),
-          ...(input.description !== undefined ? { description: input.description } : {}),
-          ...(input.specs !== undefined ? { specs: input.specs } : {}),
-          ...(input.status !== undefined ? { status: input.status } : {}),
-          updatedAt: new Date(),
-        })
-        .where(and(eq(masterCatalog.id, skuId), eq(masterCatalog.businessId, auth.businessId)))
-        .returning();
+      const data: Prisma.MasterCatalogUpdateInput = {
+        ...(input.name !== undefined ? { name: input.name } : {}),
+        ...(input.brand !== undefined ? { brand: input.brand } : {}),
+        ...(input.category !== undefined ? { category: input.category } : {}),
+        ...(input.barcode !== undefined ? { barcode: input.barcode } : {}),
+        ...(input.basePrice !== undefined ? { basePrice: input.basePrice.toFixed(2) } : {}),
+        ...(input.currency !== undefined ? { currency: input.currency } : {}),
+        ...(input.compareAtPrice !== undefined ? { compareAtPrice: input.compareAtPrice.toFixed(2) } : {}),
+        ...(input.costPrice !== undefined ? { costPrice: input.costPrice.toFixed(2) } : {}),
+        ...(input.taxRate !== undefined ? { taxRate: input.taxRate.toFixed(2) } : {}),
+        ...(input.allowBackorder !== undefined ? { allowBackorder: input.allowBackorder } : {}),
+        ...(input.unitOfMeasure !== undefined ? { unitOfMeasure: input.unitOfMeasure } : {}),
+        ...(input.skuCode !== undefined ? { skuCode: input.skuCode } : {}),
+        ...(input.isFragile !== undefined ? { isFragile: input.isFragile } : {}),
+        ...(input.requiresColdStorage !== undefined ? { requiresColdStorage: input.requiresColdStorage } : {}),
+        ...(input.weightKg !== undefined ? { weightKg: input.weightKg.toFixed(3) } : {}),
+        ...(input.dimensionsCm !== undefined
+          ? { dimensionsCm: input.dimensionsCm as Prisma.InputJsonValue }
+          : {}),
+        ...(input.defaultReorderPoint !== undefined ? { defaultReorderPoint: input.defaultReorderPoint } : {}),
+        ...(input.defaultInitialStock !== undefined ? { defaultInitialStock: input.defaultInitialStock } : {}),
+        ...(input.variantOptions !== undefined
+          ? { variantOptions: input.variantOptions as Prisma.InputJsonValue }
+          : {}),
+        ...(input.variants !== undefined ? { variants: input.variants as Prisma.InputJsonValue } : {}),
+        ...(input.images !== undefined ? { images: input.images as Prisma.InputJsonValue } : {}),
+        ...(input.description !== undefined ? { description: input.description } : {}),
+        ...(input.specs !== undefined ? { specs: input.specs as Prisma.InputJsonValue } : {}),
+        ...(input.status !== undefined ? { status: input.status } : {}),
+      };
 
-      return updated;
+      return await prisma.masterCatalog.update({
+        where: { id: skuId },
+        data,
+      });
     } catch (err: unknown) {
       const violation = asUniqueViolation(err);
       if (violation) {
-        if (violation.constraint === "master_catalog_business_sku_code_unique") {
+        if (uniqueHit(violation, "skuCode", "sku_code")) {
           throw new AppError(409, "SKU code already exists in this catalog", "DUPLICATE_SKU_CODE");
         }
         throw new AppError(409, "Barcode already exists in this catalog", "DUPLICATE_BARCODE");
@@ -157,48 +135,38 @@ export class CatalogService {
   }
 
   async listSkus(auth: AuthUser, query: ListSkusQuery) {
-    const conditions = [eq(masterCatalog.businessId, auth.businessId)];
+    const where: Prisma.MasterCatalogWhereInput = {
+      businessId: auth.businessId,
+    };
 
     if (query.status && query.status !== "unassigned") {
-      conditions.push(eq(masterCatalog.status, query.status));
+      where.status = query.status as CatalogStatus;
     }
 
     if (query.search) {
-      conditions.push(
-        or(
-          ilike(masterCatalog.name, `%${query.search}%`),
-          ilike(masterCatalog.brand, `%${query.search}%`),
-          ilike(masterCatalog.barcode, `%${query.search}%`),
-          ilike(masterCatalog.skuCode, `%${query.search}%`),
-        )!,
-      );
+      where.OR = [
+        { name: { contains: query.search, mode: "insensitive" } },
+        { brand: { contains: query.search, mode: "insensitive" } },
+        { barcode: { contains: query.search, mode: "insensitive" } },
+        { skuCode: { contains: query.search, mode: "insensitive" } },
+      ];
     }
 
     // "unassigned" = SKUs with no row in store_sku_mapping yet (HLD GET ?status=unassigned)
     if (query.status === "unassigned") {
-      conditions.push(
-        notExists(
-          db
-            .select({ one: sql`1` })
-            .from(storeSkuMapping)
-            .where(eq(storeSkuMapping.skuId, masterCatalog.id)),
-        ),
-      );
+      where.storeMappings = { none: {} };
     }
 
-    return db
-      .select()
-      .from(masterCatalog)
-      .where(and(...conditions))
-      .orderBy(desc(masterCatalog.createdAt));
+    return prisma.masterCatalog.findMany({
+      where,
+      orderBy: { createdAt: "desc" },
+    });
   }
 
   async getSku(auth: AuthUser, skuId: string) {
-    const [sku] = await db
-      .select()
-      .from(masterCatalog)
-      .where(and(eq(masterCatalog.id, skuId), eq(masterCatalog.businessId, auth.businessId)))
-      .limit(1);
+    const sku = await prisma.masterCatalog.findFirst({
+      where: { id: skuId, businessId: auth.businessId },
+    });
 
     if (!sku) {
       throw new AppError(404, "SKU not found", "NOT_FOUND");
@@ -209,22 +177,24 @@ export class CatalogService {
 
   /** Distinct brand/category values for form dropdowns (GET /api/catalog/meta). */
   async getCatalogMeta(auth: AuthUser) {
-    const [brands, categories] = await Promise.all([
-      db
-        .selectDistinct({ value: masterCatalog.brand })
-        .from(masterCatalog)
-        .where(and(eq(masterCatalog.businessId, auth.businessId), isNotNull(masterCatalog.brand)))
-        .orderBy(masterCatalog.brand),
-      db
-        .selectDistinct({ value: masterCatalog.category })
-        .from(masterCatalog)
-        .where(and(eq(masterCatalog.businessId, auth.businessId), isNotNull(masterCatalog.category)))
-        .orderBy(masterCatalog.category),
+    const [brandRows, categoryRows] = await Promise.all([
+      prisma.masterCatalog.findMany({
+        where: { businessId: auth.businessId, brand: { not: null } },
+        select: { brand: true },
+        distinct: ["brand"],
+        orderBy: { brand: "asc" },
+      }),
+      prisma.masterCatalog.findMany({
+        where: { businessId: auth.businessId, category: { not: null } },
+        select: { category: true },
+        distinct: ["category"],
+        orderBy: { category: "asc" },
+      }),
     ]);
 
     return {
-      brands: brands.map((r) => r.value).filter((v): v is string => !!v),
-      categories: categories.map((r) => r.value).filter((v): v is string => !!v),
+      brands: brandRows.map((r) => r.brand).filter((v): v is string => !!v),
+      categories: categoryRows.map((r) => r.category).filter((v): v is string => !!v),
     };
   }
 }

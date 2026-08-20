@@ -15,7 +15,7 @@ import { analyticsRouter } from "./analytics/analytics.routes.js";
  * Module registry — the single place that wires domain modules into Express.
  *
  * Microservice migration path:
- *   1. Extract module folder + its schema into a new repo
+ *   1. Extract module folder + its Prisma models into a new repo
  *   2. Replace direct service calls with HTTP/gRPC client
  *   3. Remove module from this registry; add reverse-proxy route instead
  *

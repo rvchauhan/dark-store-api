@@ -6,20 +6,30 @@
  *
  * Domain modules (catalog, store, inventory) live in src/modules/.
  * Shared concerns (auth, RBAC, errors) live in src/shared/.
- * Database schema is split by domain in src/db/schema/.
+ * Database schema lives in prisma/schema.prisma.
  *
  * Postgres only — no Redis. Snapshot reads come from inventory_snapshot table.
  */
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import swaggerUi from "swagger-ui-express";
 import { env } from "./config/env.js";
 import { registerModules } from "./modules/index.js";
 import { UPLOADS_DIR } from "./modules/catalog/catalog.routes.js";
 import { errorHandler } from "./shared/middleware/error-handler.js";
-import { pool } from "./db/client.js";
+import { prisma } from "./db/client.js";
+import { serializeDecimals } from "./shared/utils/serialize-decimals.js";
+import { openApiSpec } from "./shared/swagger/openapi.js";
 
 const app = express();
+
+// Keep Decimal wire format compatible with the former Drizzle numeric strings.
+app.use((_req, res, next) => {
+  const originalJson = res.json.bind(res);
+  res.json = ((body: unknown) => originalJson(serializeDecimals(body))) as typeof res.json;
+  next();
+});
 
 // Parse JSON bodies from the React frontend.
 // 8mb accommodates base64-encoded product images (5MB raw) sent to /api/catalog/uploads.
@@ -41,6 +51,9 @@ app.get("/health", (_req, res) => {
 // Product images uploaded via POST /api/catalog/uploads
 app.use("/uploads", express.static(UPLOADS_DIR));
 
+// Interactive API documentation — http://localhost:{PORT}/api-docs
+app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(openApiSpec as object));
+
 // Mount all domain modules under /api/*
 registerModules(app);
 
@@ -49,16 +62,17 @@ app.use(errorHandler);
 
 const server = app.listen(env.PORT, () => {
   console.log(`dark-store-api listening on http://localhost:${env.PORT}`);
-  console.log(`  Health:  http://localhost:${env.PORT}/health`);
-  console.log(`  Auth:    POST http://localhost:${env.PORT}/api/auth/login`);
-  console.log(`  Catalog: POST http://localhost:${env.PORT}/api/catalog/skus`);
+  console.log(`  Health:   http://localhost:${env.PORT}/health`);
+  console.log(`  Swagger:  http://localhost:${env.PORT}/api-docs`);
+  console.log(`  Auth:     POST http://localhost:${env.PORT}/api/auth/login`);
+  console.log(`  Catalog:  POST http://localhost:${env.PORT}/api/catalog/skus`);
 });
 
-// Graceful shutdown — drain Postgres pool before exit
+// Graceful shutdown — disconnect Prisma before exit
 async function shutdown() {
   console.log("Shutting down...");
   server.close();
-  await pool.end();
+  await prisma.$disconnect();
   process.exit(0);
 }
 

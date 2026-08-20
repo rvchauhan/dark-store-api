@@ -6,13 +6,7 @@
  */
 import "dotenv/config";
 import bcrypt from "bcryptjs";
-import { and, eq } from "drizzle-orm";
-import { db, pool } from "./client.js";
-import { businesses, users } from "./schema/tenant.js";
-import { stores, storeSkuMapping } from "./schema/store.js";
-import { masterCatalog } from "./schema/catalog.js";
-import { inventoryLedger, inventorySnapshot } from "./schema/inventory.js";
-import { customers } from "./schema/customer.js";
+import { prisma } from "./client.js";
 
 const DEMO_PASSWORD = "abcd123";
 
@@ -134,20 +128,18 @@ async function main() {
   console.log("Seeding database...");
 
   // --- Tenant root ---
-  let [businessRow] = await db.select().from(businesses).where(eq(businesses.name, "Q-Commerce")).limit(1);
-
+  let businessRow = await prisma.business.findFirst({ where: { name: "Q-Commerce" } });
   if (!businessRow) {
-    [businessRow] = await db.insert(businesses).values({ name: "Q-Commerce" }).returning();
+    businessRow = await prisma.business.create({ data: { name: "Q-Commerce" } });
   }
 
   const passwordHash = await bcrypt.hash(DEMO_PASSWORD, 10);
 
   // --- Business admin (maps to portal role "admin" / Sarah Jenkins) ---
-  let [admin] = await db.select().from(users).where(eq(users.email, "admin@qcommerce.io")).limit(1);
+  let admin = await prisma.user.findUnique({ where: { email: "admin@qcommerce.io" } });
   if (!admin) {
-    [admin] = await db
-      .insert(users)
-      .values({
+    admin = await prisma.user.create({
+      data: {
         businessId: businessRow.id,
         storeId: null,
         name: "Ravi Admin",
@@ -155,17 +147,15 @@ async function main() {
         passwordHash,
         role: "business_admin",
         status: "active",
-      })
-      .returning();
+      },
+    });
   }
 
   // --- Store (Dark Store #402 from manager UI) ---
-  let [storeRow] = await db.select().from(stores).where(eq(stores.code, "DS04")).limit(1);
-
+  let storeRow = await prisma.store.findFirst({ where: { code: "DS04" } });
   if (!storeRow) {
-    [storeRow] = await db
-      .insert(stores)
-      .values({
+    storeRow = await prisma.store.create({
+      data: {
         businessId: businessRow.id,
         name: "Dark Store #402",
         code: "DS04",
@@ -174,17 +164,15 @@ async function main() {
         operatingHours: { timezone: "Europe/London", open: "06:00", close: "23:00" },
         facility: { totalCapacityM3: 2500, coldStorage: true },
         status: "active",
-      })
-      .returning();
+      },
+    });
   }
 
   // --- Store manager (maps to portal role "manager" / Alex Thompson) ---
-  let [managerRow] = await db.select().from(users).where(eq(users.email, "manager@qcommerce.io")).limit(1);
-
+  let managerRow = await prisma.user.findUnique({ where: { email: "manager@qcommerce.io" } });
   if (!managerRow) {
-    [managerRow] = await db
-      .insert(users)
-      .values({
+    managerRow = await prisma.user.create({
+      data: {
         businessId: businessRow.id,
         storeId: storeRow.id,
         name: "Krishn Manager",
@@ -192,30 +180,27 @@ async function main() {
         passwordHash,
         role: "store_manager",
         status: "active",
-      })
-      .returning();
+      },
+    });
   }
 
   // Link store to its manager (resolves stores ↔ users circular reference).
   if (managerRow && !storeRow.managerUserId) {
-    await db
-      .update(stores)
-      .set({ managerUserId: managerRow.id, updatedAt: new Date() })
-      .where(eq(stores.id, storeRow.id));
+    storeRow = await prisma.store.update({
+      where: { id: storeRow.id },
+      data: { managerUserId: managerRow.id },
+    });
   }
 
   // --- Demo catalog: listed + stocked at the demo store, for the customer-app to browse ---
   for (const product of DEMO_PRODUCTS) {
-    let [sku] = await db
-      .select()
-      .from(masterCatalog)
-      .where(and(eq(masterCatalog.businessId, businessRow.id), eq(masterCatalog.skuCode, product.skuCode)))
-      .limit(1);
+    let sku = await prisma.masterCatalog.findFirst({
+      where: { businessId: businessRow.id, skuCode: product.skuCode },
+    });
 
     if (!sku) {
-      [sku] = await db
-        .insert(masterCatalog)
-        .values({
+      sku = await prisma.masterCatalog.create({
+        data: {
           businessId: businessRow.id,
           name: product.name,
           brand: product.brand,
@@ -226,77 +211,70 @@ async function main() {
           unitOfMeasure: product.unitOfMeasure,
           description: product.description,
           status: "active",
-        })
-        .returning();
+        },
+      });
     } else if (!sku.description) {
       // Backfill for rows seeded before `description` was added to the demo catalog.
-      [sku] = await db
-        .update(masterCatalog)
-        .set({ description: product.description, updatedAt: new Date() })
-        .where(eq(masterCatalog.id, sku.id))
-        .returning();
+      sku = await prisma.masterCatalog.update({
+        where: { id: sku.id },
+        data: { description: product.description },
+      });
     }
 
-    let [mapping] = await db
-      .select()
-      .from(storeSkuMapping)
-      .where(and(eq(storeSkuMapping.storeId, storeRow.id), eq(storeSkuMapping.skuId, sku.id)))
-      .limit(1);
+    let mapping = await prisma.storeSkuMapping.findUnique({
+      where: { storeId_skuId: { storeId: storeRow.id, skuId: sku.id } },
+    });
 
     if (!mapping) {
-      [mapping] = await db
-        .insert(storeSkuMapping)
-        .values({
+      mapping = await prisma.storeSkuMapping.create({
+        data: {
           storeId: storeRow.id,
           skuId: sku.id,
           isListed: true,
           reorderThreshold: 10,
-        })
-        .returning();
+        },
+      });
     }
 
-    const [existingSnapshot] = await db
-      .select()
-      .from(inventorySnapshot)
-      .where(and(eq(inventorySnapshot.storeId, storeRow.id), eq(inventorySnapshot.skuId, sku.id)))
-      .limit(1);
+    const existingSnapshot = await prisma.inventorySnapshot.findUnique({
+      where: { storeId_skuId: { storeId: storeRow.id, skuId: sku.id } },
+    });
 
     if (!existingSnapshot) {
       // Opening stock — a real stock_in ledger row backs the snapshot, same
       // invariant the staff portal's inventory screens rely on.
-      const [ledgerRow] = await db
-        .insert(inventoryLedger)
-        .values({
+      const ledgerRow = await prisma.inventoryLedger.create({
+        data: {
           storeId: storeRow.id,
           skuId: sku.id,
           type: "stock_in",
           quantity: product.initialStock,
           source: "seed",
-        })
-        .returning();
+        },
+      });
 
-      await db.insert(inventorySnapshot).values({
-        storeId: storeRow.id,
-        skuId: sku.id,
-        availableQty: product.initialStock,
-        lastLedgerId: ledgerRow.id,
+      await prisma.inventorySnapshot.create({
+        data: {
+          storeId: storeRow.id,
+          skuId: sku.id,
+          availableQty: product.initialStock,
+          lastLedgerId: ledgerRow.id,
+        },
       });
     }
   }
 
   // --- Demo customer (customer-app login) ---
-  let [customerRow] = await db.select().from(customers).where(eq(customers.email, "customer@qcommerce.io")).limit(1);
-
+  let customerRow = await prisma.customer.findUnique({ where: { email: "customer@qcommerce.io" } });
   if (!customerRow) {
-    [customerRow] = await db
-      .insert(customers)
-      .values({
+    customerRow = await prisma.customer.create({
+      data: {
         name: "Priya Customer",
         email: "customer@qcommerce.io",
         passwordHash,
         status: "active",
-      })
-      .returning();
+      },
+    });
   }
 
   console.log("Seed complete.");
@@ -307,10 +285,11 @@ async function main() {
   console.log("  Customer login:  customer@qcommerce.io");
   console.log("  Password:", DEMO_PASSWORD);
 
-  await pool.end();
+  await prisma.$disconnect();
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error("Seed failed:", err);
+  await prisma.$disconnect();
   process.exit(1);
 });

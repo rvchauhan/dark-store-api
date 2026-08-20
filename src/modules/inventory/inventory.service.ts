@@ -1,9 +1,5 @@
-import { and, asc, count, desc, eq, gte, lte, sql, sum } from "drizzle-orm";
-import { db } from "../../db/client.js";
-import { inventoryLedger, inventorySnapshot } from "../../db/schema/inventory.js";
-import { storeSkuMapping } from "../../db/schema/store.js";
-import { masterCatalog } from "../../db/schema/catalog.js";
-import { users } from "../../db/schema/tenant.js";
+import { Prisma } from "@prisma/client";
+import { prisma } from "../../db/client.js";
 import { AppError } from "../../shared/errors/app-error.js";
 import type { AuthUser } from "../../shared/types/auth.js";
 import type {
@@ -54,35 +50,42 @@ export class InventoryService {
   async listInventory(auth: AuthUser, storeId: string) {
     void auth;
 
-    return db
-      .select({
-        storeId: inventorySnapshot.storeId,
-        skuId: inventorySnapshot.skuId,
-        availableQty: inventorySnapshot.availableQty,
-        lastLedgerId: inventorySnapshot.lastLedgerId,
-        updatedAt: inventorySnapshot.updatedAt,
-        // Mapping / listing
-        isListed: storeSkuMapping.isListed,
-        priceOverride: storeSkuMapping.priceOverride,
-        reorderThreshold: storeSkuMapping.reorderThreshold,
-        // Catalog display fields
-        skuName: masterCatalog.name,
-        brand: masterCatalog.brand,
-        category: masterCatalog.category,
-        barcode: masterCatalog.barcode,
-        basePrice: masterCatalog.basePrice,
-      })
-      .from(inventorySnapshot)
-      .innerJoin(
-        storeSkuMapping,
-        and(
-          eq(storeSkuMapping.storeId, inventorySnapshot.storeId),
-          eq(storeSkuMapping.skuId, inventorySnapshot.skuId),
-        ),
-      )
-      .innerJoin(masterCatalog, eq(masterCatalog.id, inventorySnapshot.skuId))
-      .where(eq(inventorySnapshot.storeId, storeId))
-      .orderBy(asc(masterCatalog.name));
+    const joined = await prisma.inventorySnapshot.findMany({
+      where: { storeId },
+      include: {
+        mapping: {
+          include: {
+            sku: {
+              select: {
+                name: true,
+                brand: true,
+                category: true,
+                barcode: true,
+                basePrice: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    return joined
+      .map((row) => ({
+        storeId: row.storeId,
+        skuId: row.skuId,
+        availableQty: row.availableQty,
+        lastLedgerId: row.lastLedgerId,
+        updatedAt: row.updatedAt,
+        isListed: row.mapping.isListed,
+        priceOverride: row.mapping.priceOverride,
+        reorderThreshold: row.mapping.reorderThreshold,
+        skuName: row.mapping.sku.name,
+        brand: row.mapping.sku.brand,
+        category: row.mapping.sku.category,
+        barcode: row.mapping.sku.barcode,
+        basePrice: row.mapping.sku.basePrice,
+      }))
+      .sort((a, b) => a.skuName.localeCompare(b.skuName));
   }
 
   /**
@@ -92,41 +95,30 @@ export class InventoryService {
   async getSkuInventory(auth: AuthUser, storeId: string, skuId: string, query: SkuInventoryQuery) {
     void auth;
 
-    const [snapshot] = await db
-      .select({
-        storeId: inventorySnapshot.storeId,
-        skuId: inventorySnapshot.skuId,
-        availableQty: inventorySnapshot.availableQty,
-        lastLedgerId: inventorySnapshot.lastLedgerId,
-        updatedAt: inventorySnapshot.updatedAt,
-        isListed: storeSkuMapping.isListed,
-        priceOverride: storeSkuMapping.priceOverride,
-        reorderThreshold: storeSkuMapping.reorderThreshold,
-        skuName: masterCatalog.name,
-        brand: masterCatalog.brand,
-        category: masterCatalog.category,
-        barcode: masterCatalog.barcode,
-        basePrice: masterCatalog.basePrice,
-      })
-      .from(inventorySnapshot)
-      .innerJoin(
-        storeSkuMapping,
-        and(
-          eq(storeSkuMapping.storeId, inventorySnapshot.storeId),
-          eq(storeSkuMapping.skuId, inventorySnapshot.skuId),
-        ),
-      )
-      .innerJoin(masterCatalog, eq(masterCatalog.id, inventorySnapshot.skuId))
-      .where(and(eq(inventorySnapshot.storeId, storeId), eq(inventorySnapshot.skuId, skuId)))
-      .limit(1);
+    const snapshotRow = await prisma.inventorySnapshot.findUnique({
+      where: { storeId_skuId: { storeId, skuId } },
+      include: {
+        mapping: {
+          include: {
+            sku: {
+              select: {
+                name: true,
+                brand: true,
+                category: true,
+                barcode: true,
+                basePrice: true,
+              },
+            },
+          },
+        },
+      },
+    });
 
-    if (!snapshot) {
+    if (!snapshotRow) {
       // Mapping may exist with no snapshot yet (shouldn't happen after Step 3, but be safe)
-      const [mapping] = await db
-        .select()
-        .from(storeSkuMapping)
-        .where(and(eq(storeSkuMapping.storeId, storeId), eq(storeSkuMapping.skuId, skuId)))
-        .limit(1);
+      const mapping = await prisma.storeSkuMapping.findUnique({
+        where: { storeId_skuId: { storeId, skuId } },
+      });
 
       if (!mapping) {
         throw new AppError(404, "SKU is not assigned to this store", "SKU_NOT_MAPPED");
@@ -135,24 +127,40 @@ export class InventoryService {
       throw new AppError(404, "No inventory snapshot for this SKU yet — run a stock-in first", "NO_SNAPSHOT");
     }
 
-    const history = await db
-      .select({
-        id: inventoryLedger.id,
-        type: inventoryLedger.type,
-        quantity: inventoryLedger.quantity,
-        referenceId: inventoryLedger.referenceId,
-        source: inventoryLedger.source,
-        createdAt: inventoryLedger.createdAt,
-        employeeId: inventoryLedger.employeeId,
-        employeeName: users.name,
-      })
-      .from(inventoryLedger)
-      .leftJoin(users, eq(users.id, inventoryLedger.employeeId))
-      .where(and(eq(inventoryLedger.storeId, storeId), eq(inventoryLedger.skuId, skuId)))
-      .orderBy(desc(inventoryLedger.createdAt))
-      .limit(query.historyLimit);
+    const history = await prisma.inventoryLedger.findMany({
+      where: { storeId, skuId },
+      include: { employee: { select: { name: true } } },
+      orderBy: { createdAt: "desc" },
+      take: query.historyLimit,
+    });
 
-    return { snapshot, history };
+    return {
+      snapshot: {
+        storeId: snapshotRow.storeId,
+        skuId: snapshotRow.skuId,
+        availableQty: snapshotRow.availableQty,
+        lastLedgerId: snapshotRow.lastLedgerId,
+        updatedAt: snapshotRow.updatedAt,
+        isListed: snapshotRow.mapping.isListed,
+        priceOverride: snapshotRow.mapping.priceOverride,
+        reorderThreshold: snapshotRow.mapping.reorderThreshold,
+        skuName: snapshotRow.mapping.sku.name,
+        brand: snapshotRow.mapping.sku.brand,
+        category: snapshotRow.mapping.sku.category,
+        barcode: snapshotRow.mapping.sku.barcode,
+        basePrice: snapshotRow.mapping.sku.basePrice,
+      },
+      history: history.map((row) => ({
+        id: row.id,
+        type: row.type,
+        quantity: row.quantity,
+        referenceId: row.referenceId,
+        source: row.source,
+        createdAt: row.createdAt,
+        employeeId: row.employeeId,
+        employeeName: row.employee?.name ?? null,
+      })),
+    };
   }
 
   /**
@@ -165,57 +173,94 @@ export class InventoryService {
   async getLedgerHistory(auth: AuthUser, storeId: string, query: LedgerQuery) {
     void auth;
 
-    const conditions = [eq(inventoryLedger.storeId, storeId)];
+    const where: Prisma.InventoryLedgerWhereInput = {
+      storeId,
+      ...(query.from || query.to
+        ? {
+            createdAt: {
+              ...(query.from ? { gte: query.from } : {}),
+              ...(query.to ? { lte: query.to } : {}),
+            },
+          }
+        : {}),
+      ...(query.skuId ? { skuId: query.skuId } : {}),
+      ...(query.type ? { type: query.type } : {}),
+    };
 
-    if (query.from) conditions.push(gte(inventoryLedger.createdAt, query.from));
-    if (query.to) conditions.push(lte(inventoryLedger.createdAt, query.to));
-    if (query.skuId) conditions.push(eq(inventoryLedger.skuId, query.skuId));
-    if (query.type) conditions.push(eq(inventoryLedger.type, query.type));
-
-    const whereClause = and(...conditions);
-
-    // Total for pagination footer: "Showing 1–25 of 1,244 entries"
-    const [totalRow] = await db.select({ total: count() }).from(inventoryLedger).where(whereClause);
-    const total = Number(totalRow?.total ?? 0);
-
+    const total = await prisma.inventoryLedger.count({ where });
     const offset = (query.page - 1) * query.pageSize;
 
     // Window function: running balance for this store+sku ordered by time.
     // Uses the idx_ledger_store_sku_time index for the partition.
-    const rows = await db
-      .select({
-        id: inventoryLedger.id,
-        storeId: inventoryLedger.storeId,
-        skuId: inventoryLedger.skuId,
-        type: inventoryLedger.type,
-        quantity: inventoryLedger.quantity,
-        referenceId: inventoryLedger.referenceId,
-        source: inventoryLedger.source,
-        createdAt: inventoryLedger.createdAt,
-        employeeId: inventoryLedger.employeeId,
-        employeeName: users.name,
-        skuName: masterCatalog.name,
-        barcode: masterCatalog.barcode,
-        category: masterCatalog.category,
-        // Running balance after this event for (store, sku)
-        balance: sql<number>`
-          sum(${inventoryLedger.quantity}) over (
-            partition by ${inventoryLedger.storeId}, ${inventoryLedger.skuId}
-            order by ${inventoryLedger.createdAt} asc, ${inventoryLedger.id} asc
-            rows between unbounded preceding and current row
-          )
-        `.mapWith(Number),
-      })
-      .from(inventoryLedger)
-      .leftJoin(users, eq(users.id, inventoryLedger.employeeId))
-      .innerJoin(masterCatalog, eq(masterCatalog.id, inventoryLedger.skuId))
-      .where(whereClause)
-      .orderBy(desc(inventoryLedger.createdAt))
-      .limit(query.pageSize)
-      .offset(offset);
+    type LedgerRow = {
+      id: string;
+      store_id: string;
+      sku_id: string;
+      type: string;
+      quantity: number;
+      reference_id: string | null;
+      source: string | null;
+      created_at: Date;
+      employee_id: string | null;
+      employee_name: string | null;
+      sku_name: string;
+      barcode: string | null;
+      category: string | null;
+      balance: number;
+    };
+
+    const filters: Prisma.Sql[] = [Prisma.sql`l.store_id = ${storeId}::uuid`];
+    if (query.from) filters.push(Prisma.sql`l.created_at >= ${query.from}`);
+    if (query.to) filters.push(Prisma.sql`l.created_at <= ${query.to}`);
+    if (query.skuId) filters.push(Prisma.sql`l.sku_id = ${query.skuId}::uuid`);
+    if (query.type) filters.push(Prisma.sql`l.type = ${query.type}::ledger_entry_type`);
+
+    const rows = await prisma.$queryRaw<LedgerRow[]>(Prisma.sql`
+      SELECT
+        l.id,
+        l.store_id,
+        l.sku_id,
+        l.type::text AS type,
+        l.quantity,
+        l.reference_id,
+        l.source,
+        l.created_at,
+        l.employee_id,
+        u.name AS employee_name,
+        c.name AS sku_name,
+        c.barcode,
+        c.category,
+        SUM(l.quantity) OVER (
+          PARTITION BY l.store_id, l.sku_id
+          ORDER BY l.created_at ASC, l.id ASC
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )::int AS balance
+      FROM inventory_ledger l
+      LEFT JOIN users u ON u.id = l.employee_id
+      INNER JOIN master_catalog c ON c.id = l.sku_id
+      WHERE ${Prisma.join(filters, " AND ")}
+      ORDER BY l.created_at DESC
+      LIMIT ${query.pageSize}
+      OFFSET ${offset}
+    `);
 
     return {
-      data: rows,
+      data: rows.map((row) => ({
+        id: row.id,
+        storeId: row.store_id,
+        skuId: row.sku_id,
+        type: row.type,
+        quantity: row.quantity,
+        referenceId: row.reference_id,
+        source: row.source,
+        createdAt: row.created_at,
+        employeeId: row.employee_id,
+        employeeName: row.employee_name,
+        skuName: row.sku_name,
+        barcode: row.barcode,
+        category: row.category,
+        balance: Number(row.balance),
+      })),
       pagination: {
         page: query.page,
         pageSize: query.pageSize,
@@ -234,16 +279,13 @@ export class InventoryService {
 
     const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-    const rows = await db
-      .select({
-        type: inventoryLedger.type,
-        totalQty: sum(inventoryLedger.quantity),
-      })
-      .from(inventoryLedger)
-      .where(and(eq(inventoryLedger.storeId, storeId), gte(inventoryLedger.createdAt, since)))
-      .groupBy(inventoryLedger.type);
+    const rows = await prisma.inventoryLedger.groupBy({
+      by: ["type"],
+      where: { storeId, createdAt: { gte: since } },
+      _sum: { quantity: true },
+    });
 
-    const byType = Object.fromEntries(rows.map((r) => [r.type, Number(r.totalQty ?? 0)]));
+    const byType = Object.fromEntries(rows.map((r) => [r.type, Number(r._sum.quantity ?? 0)]));
 
     return {
       since: since.toISOString(),
@@ -266,11 +308,9 @@ export class InventoryService {
    */
   async recordMovement(auth: AuthUser, storeId: string, input: InventoryMovementInput) {
     // Verify the SKU is assigned to this store before accepting stock movement
-    const [mapping] = await db
-      .select()
-      .from(storeSkuMapping)
-      .where(and(eq(storeSkuMapping.storeId, storeId), eq(storeSkuMapping.skuId, input.skuId)))
-      .limit(1);
+    const mapping = await prisma.storeSkuMapping.findUnique({
+      where: { storeId_skuId: { storeId, skuId: input.skuId } },
+    });
 
     if (!mapping) {
       throw new AppError(400, "SKU is not assigned to this store", "SKU_NOT_MAPPED");
@@ -281,10 +321,9 @@ export class InventoryService {
       throw new AppError(400, "Quantity delta cannot be zero", "INVALID_QUANTITY");
     }
 
-    return db.transaction(async (tx) => {
-      const [ledgerRow] = await tx
-        .insert(inventoryLedger)
-        .values({
+    return prisma.$transaction(async (tx) => {
+      const ledgerRow = await tx.inventoryLedger.create({
+        data: {
           storeId,
           skuId: input.skuId,
           type: input.type,
@@ -292,26 +331,23 @@ export class InventoryService {
           referenceId: input.referenceId,
           employeeId: auth.userId,
           source: input.source ?? `manual_${input.type}`,
-        })
-        .returning();
+        },
+      });
 
       // Snapshot must already exist after Step 3 assignment; upsert covers edge cases
-      await tx
-        .insert(inventorySnapshot)
-        .values({
+      await tx.inventorySnapshot.upsert({
+        where: { storeId_skuId: { storeId, skuId: input.skuId } },
+        create: {
           storeId,
           skuId: input.skuId,
           availableQty: Math.max(0, delta), // opening from zero if somehow missing
           lastLedgerId: ledgerRow.id,
-        })
-        .onConflictDoUpdate({
-          target: [inventorySnapshot.storeId, inventorySnapshot.skuId],
-          set: {
-            availableQty: sql`${inventorySnapshot.availableQty} + ${delta}`,
-            lastLedgerId: ledgerRow.id,
-            updatedAt: new Date(),
-          },
-        });
+        },
+        update: {
+          availableQty: { increment: delta },
+          lastLedgerId: ledgerRow.id,
+        },
+      });
 
       // MVP "event": stock.updated
       return ledgerRow;

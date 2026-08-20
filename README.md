@@ -20,7 +20,19 @@ dark-store-api/        Express API (this repo)         — port 3001
 | `store`   | `/api/stores`            | `stores`, `store_sku_mapping` (TODO)   | Step 2–3 |
 | `inventory` | `/api/stores/:id/inventory` | `inventory_ledger`, `inventory_snapshot` | Step 4–6 |
 
-Each module folder is self-contained (`routes` → `service` → `schemas`). To extract a microservice later, move the folder + its schema tables into a new repo and replace in-process calls with HTTP.
+Each module folder is self-contained (`routes` → `service` → `schemas`). To extract a microservice later, move the folder + its tables (from `prisma/schema.prisma`) into a new repo and replace in-process calls with HTTP.
+
+### Database (Prisma)
+
+Schema: `prisma/schema.prisma`. Migrations: `prisma/migrations/`.
+
+| Script | Purpose |
+|--------|---------|
+| `npm run db:migrate` | Apply pending migrations (`prisma migrate deploy`) |
+| `npm run db:migrate:dev` | Create/apply migrations in development |
+| `npm run db:seed` | Idempotent demo data |
+| `npm run db:studio` | Prisma Studio |
+| `npm run db:reset` | Wipe Docker volume, migrate, seed |
 
 ## Quick start
 
@@ -31,17 +43,31 @@ docker compose up -d
 # 2. Install dependencies
 npm install
 
-# 3. Run migrations + seed
+# 3. Run Prisma migrations + seed
 npm run db:setup
 
-# If migrations fail with "type already exists", reset the Docker volume:
+# If the DB still has old Drizzle migration history, reset the Docker volume:
 # npm run db:reset
 
 # 4. Start API dev server
 npm run dev
 ```
 
-## Demo credentials (from seed)
+## Demo credentials (optional seed)
+
+`npm run db:seed` is **optional** and no longer runs as part of `db:setup`. Prefer restoring real local data:
+
+```bash
+npm run db:restore-local   # copies older local Postgres (:5432) into Docker (:5433)
+```
+
+Manager account after restore: `ravi@yopmail.com` / `abcd123` (Koramangala Dark Store).
+
+Admin account after restore: `admin@yopmail.com` / `abcd123` (Dark Story Groceries — all stores).
+
+Re-apply yopmail accounts without a full restore: `npm run db:ensure-accounts`
+
+Optional seed personas (only if you explicitly run `db:seed`):
 
 | Email               | Password | Role           |
 |---------------------|----------|----------------|

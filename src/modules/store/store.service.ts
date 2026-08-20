@@ -1,9 +1,6 @@
-import { and, count, eq, gte, lte, sum } from "drizzle-orm";
-import { db } from "../../db/client.js";
-import { stores, storeSkuMapping } from "../../db/schema/store.js";
-import { masterCatalog } from "../../db/schema/catalog.js";
-import { users } from "../../db/schema/tenant.js";
-import { inventoryLedger, inventorySnapshot } from "../../db/schema/inventory.js";
+import { Prisma } from "@prisma/client";
+import { prisma } from "../../db/client.js";
+import { asUniqueViolation } from "../../db/prisma-helpers.js";
 import { AppError } from "../../shared/errors/app-error.js";
 import type { AuthUser } from "../../shared/types/auth.js";
 import type {
@@ -36,19 +33,20 @@ export class StoreService {
   // -----------------------------------------------------------------------
 
   async createStore(auth: AuthUser, input: CreateStoreInput) {
-    const [store] = await db
-      .insert(stores)
-      .values({
+    const store = await prisma.store.create({
+      data: {
         businessId: auth.businessId,
         name: input.name,
         code: input.code,
         address: input.address,
-        geofence: input.geofence,
-        operatingHours: input.operatingHours,
-        facility: input.facility,
+        geofence: input.geofence as Prisma.InputJsonValue,
+        operatingHours: input.operatingHours as Prisma.InputJsonValue,
+        ...(input.facility !== undefined
+          ? { facility: input.facility as Prisma.InputJsonValue }
+          : {}),
         status: "onboarding",
-      })
-      .returning();
+      },
+    });
 
     // MVP "event": store.onboarding_started
     return store;
@@ -57,29 +55,15 @@ export class StoreService {
   async listStores(auth: AuthUser) {
     // Store managers only see their own store; admins see all in the business
     if (auth.role !== "business_admin" && auth.storeId) {
-      const [store] = await db
-        .select(this.storeWithManagerColumns())
-        .from(stores)
-        .leftJoin(users, eq(stores.managerUserId, users.id))
-        .where(eq(stores.id, auth.storeId))
-        .limit(1);
+      const store = await this.findStoreWithManager({ id: auth.storeId });
       return store ? [store] : [];
     }
 
-    return db
-      .select(this.storeWithManagerColumns())
-      .from(stores)
-      .leftJoin(users, eq(stores.managerUserId, users.id))
-      .where(eq(stores.businessId, auth.businessId));
+    return this.findStoresWithManager({ businessId: auth.businessId });
   }
 
   async getStore(auth: AuthUser, storeId: string) {
-    const [store] = await db
-      .select(this.storeWithManagerColumns())
-      .from(stores)
-      .leftJoin(users, eq(stores.managerUserId, users.id))
-      .where(eq(stores.id, storeId))
-      .limit(1);
+    const store = await this.findStoreWithManager({ id: storeId });
 
     if (!store || store.businessId !== auth.businessId) {
       throw new AppError(404, "Store not found", "NOT_FOUND");
@@ -101,55 +85,47 @@ export class StoreService {
   async getDashboardStats(auth: AuthUser) {
     const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-    const storeRows = await db
-      .select({ id: stores.id, name: stores.name, code: stores.code, status: stores.status })
-      .from(stores)
-      .where(eq(stores.businessId, auth.businessId));
+    const storeRows = await prisma.store.findMany({
+      where: { businessId: auth.businessId },
+      select: { id: true, name: true, code: true, status: true },
+    });
 
-    const [{ value: skusInCatalog }] = await db
-      .select({ value: count() })
-      .from(masterCatalog)
-      .where(eq(masterCatalog.businessId, auth.businessId));
+    const skusInCatalog = await prisma.masterCatalog.count({
+      where: { businessId: auth.businessId },
+    });
 
     const pickedRows =
       storeRows.length === 0
         ? []
-        : await db
-            .select({ storeId: inventoryLedger.storeId, totalQty: sum(inventoryLedger.quantity) })
-            .from(inventoryLedger)
-            .innerJoin(stores, eq(stores.id, inventoryLedger.storeId))
-            .where(
-              and(
-                eq(stores.businessId, auth.businessId),
-                eq(inventoryLedger.type, "sale"),
-                gte(inventoryLedger.createdAt, since),
-              ),
-            )
-            .groupBy(inventoryLedger.storeId);
+        : await prisma.inventoryLedger.groupBy({
+            by: ["storeId"],
+            where: {
+              type: "sale",
+              createdAt: { gte: since },
+              mapping: { store: { businessId: auth.businessId } },
+            },
+            _sum: { quantity: true },
+          });
 
-    const pickedByStore = new Map(pickedRows.map((r) => [r.storeId, Math.abs(Number(r.totalQty ?? 0))]));
+    const pickedByStore = new Map(
+      pickedRows.map((r) => [r.storeId, Math.abs(Number(r._sum.quantity ?? 0))]),
+    );
 
-    const [{ value: lowStockAlerts }] =
+    const lowStockAlerts =
       storeRows.length === 0
-        ? [{ value: 0 }]
-        : await db
-            .select({ value: count() })
-            .from(inventorySnapshot)
-            .innerJoin(
-              storeSkuMapping,
-              and(
-                eq(storeSkuMapping.storeId, inventorySnapshot.storeId),
-                eq(storeSkuMapping.skuId, inventorySnapshot.skuId),
-              ),
-            )
-            .innerJoin(stores, eq(stores.id, inventorySnapshot.storeId))
-            .where(
-              and(
-                eq(stores.businessId, auth.businessId),
-                eq(storeSkuMapping.isListed, true),
-                lte(inventorySnapshot.availableQty, storeSkuMapping.reorderThreshold),
-              ),
-            );
+        ? 0
+        : (
+            await prisma.$queryRaw<[{ value: bigint }]>`
+              SELECT COUNT(*)::bigint AS value
+              FROM inventory_snapshot s
+              INNER JOIN store_sku_mapping m
+                ON m.store_id = s.store_id AND m.sku_id = s.sku_id
+              INNER JOIN stores st ON st.id = s.store_id
+              WHERE st.business_id = ${auth.businessId}::uuid
+                AND m.is_listed = true
+                AND s.available_qty <= m.reorder_threshold
+            `
+          )[0]?.value ?? 0n;
 
     const perStorePicked = storeRows
       .map((s) => ({
@@ -164,31 +140,10 @@ export class StoreService {
       since: since.toISOString(),
       activeStores: storeRows.filter((s) => s.status === "active").length,
       totalStores: storeRows.length,
-      skusInCatalog: Number(skusInCatalog ?? 0),
+      skusInCatalog,
       totalPickedUnits24h: perStorePicked.reduce((sum, r) => sum + r.pickedUnits, 0),
-      lowStockAlerts: Number(lowStockAlerts ?? 0),
+      lowStockAlerts: Number(lowStockAlerts),
       perStorePicked,
-    };
-  }
-
-  /** Store columns + the assigned manager's name/email/status (null if unassigned). */
-  private storeWithManagerColumns() {
-    return {
-      id: stores.id,
-      businessId: stores.businessId,
-      name: stores.name,
-      code: stores.code,
-      address: stores.address,
-      geofence: stores.geofence,
-      operatingHours: stores.operatingHours,
-      facility: stores.facility,
-      status: stores.status,
-      managerUserId: stores.managerUserId,
-      createdAt: stores.createdAt,
-      updatedAt: stores.updatedAt,
-      managerName: users.name,
-      managerEmail: users.email,
-      managerStatus: users.status,
     };
   }
 
@@ -200,21 +155,21 @@ export class StoreService {
   async updateStore(auth: AuthUser, storeId: string, input: UpdateStoreInput) {
     await this.getStore(auth, storeId);
 
-    const [updated] = await db
-      .update(stores)
-      .set({
+    return prisma.store.update({
+      where: { id: storeId },
+      data: {
         ...(input.name !== undefined ? { name: input.name } : {}),
         ...(input.code !== undefined ? { code: input.code } : {}),
         ...(input.address !== undefined ? { address: input.address } : {}),
-        ...(input.geofence !== undefined ? { geofence: input.geofence } : {}),
-        ...(input.operatingHours !== undefined ? { operatingHours: input.operatingHours } : {}),
-        ...(input.facility !== undefined ? { facility: input.facility } : {}),
-        updatedAt: new Date(),
-      })
-      .where(eq(stores.id, storeId))
-      .returning();
-
-    return updated;
+        ...(input.geofence !== undefined ? { geofence: input.geofence as Prisma.InputJsonValue } : {}),
+        ...(input.operatingHours !== undefined
+          ? { operatingHours: input.operatingHours as Prisma.InputJsonValue }
+          : {}),
+        ...(input.facility !== undefined
+          ? { facility: (input.facility ?? Prisma.JsonNull) as Prisma.InputJsonValue }
+          : {}),
+      },
+    });
   }
 
   async activateStore(auth: AuthUser, storeId: string) {
@@ -224,11 +179,10 @@ export class StoreService {
       return store;
     }
 
-    const [updated] = await db
-      .update(stores)
-      .set({ status: "active", updatedAt: new Date() })
-      .where(eq(stores.id, storeId))
-      .returning();
+    const updated = await prisma.store.update({
+      where: { id: storeId },
+      data: { status: "active" },
+    });
 
     // MVP "event": store.activated
     return updated;
@@ -256,27 +210,38 @@ export class StoreService {
   async listSkuMappings(auth: AuthUser, storeId: string) {
     await this.getStore(auth, storeId);
 
-    return db
-      .select({
-        id: storeSkuMapping.id,
-        storeId: storeSkuMapping.storeId,
-        skuId: storeSkuMapping.skuId,
-        priceOverride: storeSkuMapping.priceOverride,
-        isListed: storeSkuMapping.isListed,
-        reorderThreshold: storeSkuMapping.reorderThreshold,
-        createdAt: storeSkuMapping.createdAt,
-        updatedAt: storeSkuMapping.updatedAt,
-        // Catalog fields — frontend uses these for product cards / table rows
-        skuName: masterCatalog.name,
-        brand: masterCatalog.brand,
-        category: masterCatalog.category,
-        barcode: masterCatalog.barcode,
-        basePrice: masterCatalog.basePrice,
-        catalogStatus: masterCatalog.status,
-      })
-      .from(storeSkuMapping)
-      .innerJoin(masterCatalog, eq(storeSkuMapping.skuId, masterCatalog.id))
-      .where(eq(storeSkuMapping.storeId, storeId));
+    const rows = await prisma.storeSkuMapping.findMany({
+      where: { storeId },
+      include: {
+        sku: {
+          select: {
+            name: true,
+            brand: true,
+            category: true,
+            barcode: true,
+            basePrice: true,
+            status: true,
+          },
+        },
+      },
+    });
+
+    return rows.map((row) => ({
+      id: row.id,
+      storeId: row.storeId,
+      skuId: row.skuId,
+      priceOverride: row.priceOverride,
+      isListed: row.isListed,
+      reorderThreshold: row.reorderThreshold,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      skuName: row.sku.name,
+      brand: row.sku.brand,
+      category: row.sku.category,
+      barcode: row.sku.barcode,
+      basePrice: row.sku.basePrice,
+      catalogStatus: row.sku.status,
+    }));
   }
 
   /**
@@ -286,30 +251,24 @@ export class StoreService {
   async updateSkuMapping(auth: AuthUser, storeId: string, skuId: string, input: UpdateSkuMappingInput) {
     await this.getStore(auth, storeId);
 
-    const [existing] = await db
-      .select()
-      .from(storeSkuMapping)
-      .where(and(eq(storeSkuMapping.storeId, storeId), eq(storeSkuMapping.skuId, skuId)))
-      .limit(1);
+    const existing = await prisma.storeSkuMapping.findUnique({
+      where: { storeId_skuId: { storeId, skuId } },
+    });
 
     if (!existing) {
       throw new AppError(404, "SKU mapping not found for this store", "NOT_FOUND");
     }
 
-    const [updated] = await db
-      .update(storeSkuMapping)
-      .set({
+    return prisma.storeSkuMapping.update({
+      where: { storeId_skuId: { storeId, skuId } },
+      data: {
         ...(input.priceOverride !== undefined
           ? { priceOverride: input.priceOverride === null ? null : input.priceOverride.toFixed(2) }
           : {}),
         ...(input.isListed !== undefined ? { isListed: input.isListed } : {}),
         ...(input.reorderThreshold !== undefined ? { reorderThreshold: input.reorderThreshold } : {}),
-        updatedAt: new Date(),
-      })
-      .where(and(eq(storeSkuMapping.storeId, storeId), eq(storeSkuMapping.skuId, skuId)))
-      .returning();
-
-    return updated;
+      },
+    });
   }
 
   /**
@@ -319,22 +278,19 @@ export class StoreService {
   async removeSkuMapping(auth: AuthUser, storeId: string, skuId: string) {
     await this.getStore(auth, storeId);
 
-    const [existing] = await db
-      .select()
-      .from(storeSkuMapping)
-      .where(and(eq(storeSkuMapping.storeId, storeId), eq(storeSkuMapping.skuId, skuId)))
-      .limit(1);
+    const existing = await prisma.storeSkuMapping.findUnique({
+      where: { storeId_skuId: { storeId, skuId } },
+    });
 
     if (!existing) {
       throw new AppError(404, "SKU mapping not found for this store", "NOT_FOUND");
     }
 
     // Guard: ledger FK targets (store_id, sku_id) — deleting the mapping would violate integrity.
-    const [ledgerHit] = await db
-      .select({ id: inventoryLedger.id })
-      .from(inventoryLedger)
-      .where(and(eq(inventoryLedger.storeId, storeId), eq(inventoryLedger.skuId, skuId)))
-      .limit(1);
+    const ledgerHit = await prisma.inventoryLedger.findFirst({
+      where: { storeId, skuId },
+      select: { id: true },
+    });
 
     if (ledgerHit) {
       throw new AppError(
@@ -344,16 +300,10 @@ export class StoreService {
       );
     }
 
-    return db.transaction(async (tx) => {
+    return prisma.$transaction(async (tx) => {
       // Snapshot FK also points at the mapping pair — remove it first.
-      await tx
-        .delete(inventorySnapshot)
-        .where(and(eq(inventorySnapshot.storeId, storeId), eq(inventorySnapshot.skuId, skuId)));
-
-      await tx
-        .delete(storeSkuMapping)
-        .where(and(eq(storeSkuMapping.storeId, storeId), eq(storeSkuMapping.skuId, skuId)));
-
+      await tx.inventorySnapshot.deleteMany({ where: { storeId, skuId } });
+      await tx.storeSkuMapping.delete({ where: { storeId_skuId: { storeId, skuId } } });
       return { storeId, skuId, removed: true };
     });
   }
@@ -370,9 +320,7 @@ export class StoreService {
     // Normalize JSON array or CSV string into the same item shape
     let items: SkuMappingItemInput[];
     try {
-      items = input.mappings?.length
-        ? input.mappings
-        : parseSkuMappingCsv(input.csv!);
+      items = input.mappings?.length ? input.mappings : parseSkuMappingCsv(input.csv!);
     } catch (err) {
       throw new AppError(400, err instanceof Error ? err.message : "Invalid CSV", "VALIDATION_ERROR");
     }
@@ -397,46 +345,37 @@ export class StoreService {
       seen.add(r.skuId);
     }
 
-    return db.transaction(async (tx) => {
+    return prisma.$transaction(async (tx) => {
       const results = [];
 
       for (const { skuId, item } of resolved) {
-        const [mapping] = await tx
-          .insert(storeSkuMapping)
-          .values({
+        const mapping = await tx.storeSkuMapping.upsert({
+          where: { storeId_skuId: { storeId, skuId } },
+          create: {
             storeId,
             skuId,
             priceOverride: item.priceOverride == null ? null : item.priceOverride.toFixed(2),
             isListed: item.isListed,
             reorderThreshold: item.reorderThreshold,
-          })
-          .onConflictDoUpdate({
-            // UNIQUE (store_id, sku_id) — re-import updates listing/price instead of failing
-            target: [storeSkuMapping.storeId, storeSkuMapping.skuId],
-            set: {
-              priceOverride: item.priceOverride == null ? null : item.priceOverride.toFixed(2),
-              isListed: item.isListed,
-              reorderThreshold: item.reorderThreshold,
-              updatedAt: new Date(),
-            },
-          })
-          .returning();
+          },
+          update: {
+            priceOverride: item.priceOverride == null ? null : item.priceOverride.toFixed(2),
+            isListed: item.isListed,
+            reorderThreshold: item.reorderThreshold,
+          },
+        });
 
         // Ensure snapshot exists (idempotent — do nothing if already present)
-        await tx
-          .insert(inventorySnapshot)
-          .values({
-            storeId,
-            skuId,
-            availableQty: 0,
-          })
-          .onConflictDoNothing();
+        await tx.inventorySnapshot.createMany({
+          data: [{ storeId, skuId, availableQty: 0 }],
+          skipDuplicates: true,
+        });
 
         // Activate catalog SKU if it was still draft
-        await tx
-          .update(masterCatalog)
-          .set({ status: "active", updatedAt: new Date() })
-          .where(and(eq(masterCatalog.id, skuId), eq(masterCatalog.status, "draft")));
+        await tx.masterCatalog.updateMany({
+          where: { id: skuId, status: "draft" },
+          data: { status: "active" },
+        });
 
         results.push(mapping);
       }
@@ -449,6 +388,38 @@ export class StoreService {
   // -----------------------------------------------------------------------
   // Internals
   // -----------------------------------------------------------------------
+
+  private async findStoreWithManager(where: { id?: string; businessId?: string }) {
+    const stores = await this.findStoresWithManager(where);
+    return stores[0] ?? null;
+  }
+
+  private async findStoresWithManager(where: { id?: string; businessId?: string }) {
+    const rows = await prisma.store.findMany({
+      where,
+      include: {
+        manager: { select: { name: true, email: true, status: true } },
+      },
+    });
+
+    return rows.map((store) => ({
+      id: store.id,
+      businessId: store.businessId,
+      name: store.name,
+      code: store.code,
+      address: store.address,
+      geofence: store.geofence,
+      operatingHours: store.operatingHours,
+      facility: store.facility,
+      status: store.status,
+      managerUserId: store.managerUserId,
+      createdAt: store.createdAt,
+      updatedAt: store.updatedAt,
+      managerName: store.manager?.name ?? null,
+      managerEmail: store.manager?.email ?? null,
+      managerStatus: store.manager?.status ?? null,
+    }));
+  }
 
   /** Wizard (onboarding) and live stores can receive mappings; closed/inactive cannot. */
   private assertStoreAcceptsMappings(status: string) {
@@ -464,11 +435,9 @@ export class StoreService {
   /** Resolve skuId or barcode → catalog row, scoped to the tenant. */
   private async resolveSku(businessId: string, input: { skuId?: string; barcode?: string }) {
     if (input.skuId) {
-      const [sku] = await db
-        .select()
-        .from(masterCatalog)
-        .where(and(eq(masterCatalog.id, input.skuId), eq(masterCatalog.businessId, businessId)))
-        .limit(1);
+      const sku = await prisma.masterCatalog.findFirst({
+        where: { id: input.skuId, businessId },
+      });
 
       if (!sku) {
         throw new AppError(404, `SKU not found: ${input.skuId}`, "SKU_NOT_FOUND");
@@ -480,11 +449,9 @@ export class StoreService {
     }
 
     // barcode path — used by CSV imports from floor scanners / supplier sheets
-    const [sku] = await db
-      .select()
-      .from(masterCatalog)
-      .where(and(eq(masterCatalog.barcode, input.barcode!), eq(masterCatalog.businessId, businessId)))
-      .limit(1);
+    const sku = await prisma.masterCatalog.findFirst({
+      where: { barcode: input.barcode!, businessId },
+    });
 
     if (!sku) {
       throw new AppError(404, `No SKU with barcode: ${input.barcode}`, "SKU_NOT_FOUND");
@@ -501,37 +468,34 @@ export class StoreService {
    */
   private async assignSkuInTransaction(storeId: string, skuId: string, input: CreateSkuMappingInput) {
     try {
-      return await db.transaction(async (tx) => {
-        const [mapping] = await tx
-          .insert(storeSkuMapping)
-          .values({
+      return await prisma.$transaction(async (tx) => {
+        const mapping = await tx.storeSkuMapping.create({
+          data: {
             storeId,
             skuId,
             priceOverride: input.priceOverride == null ? null : input.priceOverride.toFixed(2),
             isListed: input.isListed,
             reorderThreshold: input.reorderThreshold,
-          })
-          .returning();
+          },
+        });
 
         // Opening snapshot so stock-in (Step 4) has a row to update
-        await tx.insert(inventorySnapshot).values({
-          storeId,
-          skuId,
-          availableQty: 0,
+        await tx.inventorySnapshot.create({
+          data: { storeId, skuId, availableQty: 0 },
         });
 
         // HLD: status stays 'draft' until at least one store assignment exists
-        await tx
-          .update(masterCatalog)
-          .set({ status: "active", updatedAt: new Date() })
-          .where(and(eq(masterCatalog.id, skuId), eq(masterCatalog.status, "draft")));
+        await tx.masterCatalog.updateMany({
+          where: { id: skuId, status: "draft" },
+          data: { status: "active" },
+        });
 
         // MVP "event": sku.assigned
         return mapping;
       });
     } catch (err: unknown) {
       // Unique violation on (store_id, sku_id)
-      if (typeof err === "object" && err !== null && "code" in err && err.code === "23505") {
+      if (asUniqueViolation(err)) {
         throw new AppError(409, "SKU is already assigned to this store", "ALREADY_MAPPED");
       }
       throw err;

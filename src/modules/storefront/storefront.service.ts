@@ -1,8 +1,4 @@
-import { and, eq } from "drizzle-orm";
-import { db } from "../../db/client.js";
-import { stores, storeSkuMapping } from "../../db/schema/store.js";
-import { masterCatalog } from "../../db/schema/catalog.js";
-import { inventorySnapshot } from "../../db/schema/inventory.js";
+import { prisma } from "../../db/client.js";
 import { AppError } from "../../shared/errors/app-error.js";
 
 /**
@@ -14,32 +10,39 @@ import { AppError } from "../../shared/errors/app-error.js";
  */
 export class StorefrontService {
   async listActiveStores() {
-    return db
-      .select({
-        id: stores.id,
-        name: stores.name,
-        address: stores.address,
-        geofence: stores.geofence,
-      })
-      .from(stores)
-      .where(eq(stores.status, "active"));
+    return prisma.store.findMany({
+      where: { status: "active" },
+      select: {
+        id: true,
+        name: true,
+        address: true,
+        geofence: true,
+      },
+    });
   }
 
   async listStoreProducts(storeId: string) {
     await this.assertStoreActive(storeId);
 
-    const rows = await db
-      .select(this.productColumns())
-      .from(storeSkuMapping)
-      .innerJoin(masterCatalog, eq(storeSkuMapping.skuId, masterCatalog.id))
-      .leftJoin(
-        inventorySnapshot,
-        and(
-          eq(inventorySnapshot.storeId, storeSkuMapping.storeId),
-          eq(inventorySnapshot.skuId, storeSkuMapping.skuId),
-        ),
-      )
-      .where(and(eq(storeSkuMapping.storeId, storeId), eq(storeSkuMapping.isListed, true)));
+    const rows = await prisma.storeSkuMapping.findMany({
+      where: { storeId, isListed: true },
+      include: {
+        sku: {
+          select: {
+            id: true,
+            name: true,
+            brand: true,
+            category: true,
+            basePrice: true,
+            compareAtPrice: true,
+            unitOfMeasure: true,
+            images: true,
+            description: true,
+          },
+        },
+        snapshot: { select: { availableQty: true } },
+      },
+    });
 
     return rows.map((row) => this.toProduct(row));
   }
@@ -47,25 +50,25 @@ export class StorefrontService {
   async getStoreProduct(storeId: string, skuId: string) {
     await this.assertStoreActive(storeId);
 
-    const [row] = await db
-      .select(this.productColumns())
-      .from(storeSkuMapping)
-      .innerJoin(masterCatalog, eq(storeSkuMapping.skuId, masterCatalog.id))
-      .leftJoin(
-        inventorySnapshot,
-        and(
-          eq(inventorySnapshot.storeId, storeSkuMapping.storeId),
-          eq(inventorySnapshot.skuId, storeSkuMapping.skuId),
-        ),
-      )
-      .where(
-        and(
-          eq(storeSkuMapping.storeId, storeId),
-          eq(storeSkuMapping.skuId, skuId),
-          eq(storeSkuMapping.isListed, true),
-        ),
-      )
-      .limit(1);
+    const row = await prisma.storeSkuMapping.findFirst({
+      where: { storeId, skuId, isListed: true },
+      include: {
+        sku: {
+          select: {
+            id: true,
+            name: true,
+            brand: true,
+            category: true,
+            basePrice: true,
+            compareAtPrice: true,
+            unitOfMeasure: true,
+            images: true,
+            description: true,
+          },
+        },
+        snapshot: { select: { availableQty: true } },
+      },
+    });
 
     if (!row) {
       throw new AppError(404, "Product not found", "NOT_FOUND");
@@ -74,52 +77,42 @@ export class StorefrontService {
     return this.toProduct(row);
   }
 
-  private productColumns() {
-    return {
-      skuId: masterCatalog.id,
-      name: masterCatalog.name,
-      brand: masterCatalog.brand,
-      category: masterCatalog.category,
-      basePrice: masterCatalog.basePrice,
-      priceOverride: storeSkuMapping.priceOverride,
-      compareAtPrice: masterCatalog.compareAtPrice,
-      unitOfMeasure: masterCatalog.unitOfMeasure,
-      images: masterCatalog.images,
-      description: masterCatalog.description,
-      availableQty: inventorySnapshot.availableQty,
-    };
-  }
-
   /** Shapes the joined row into a flat customer-facing product — one price field, no raw override/base ambiguity. */
   private toProduct(row: {
-    skuId: string;
-    name: string;
-    brand: string | null;
-    category: string | null;
-    basePrice: string;
-    priceOverride: string | null;
-    compareAtPrice: string | null;
-    unitOfMeasure: string;
-    images: unknown;
-    description: string | null;
-    availableQty: number | null;
+    priceOverride: { toString(): string } | null;
+    sku: {
+      id: string;
+      name: string;
+      brand: string | null;
+      category: string | null;
+      basePrice: { toString(): string };
+      compareAtPrice: { toString(): string } | null;
+      unitOfMeasure: string;
+      images: unknown;
+      description: string | null;
+    };
+    snapshot: { availableQty: number } | null;
   }) {
     return {
-      skuId: row.skuId,
-      name: row.name,
-      brand: row.brand,
-      category: row.category,
-      price: row.priceOverride ?? row.basePrice,
-      compareAtPrice: row.compareAtPrice,
-      unitOfMeasure: row.unitOfMeasure,
-      images: Array.isArray(row.images) ? row.images : [],
-      description: row.description,
-      availableQty: row.availableQty ?? 0,
+      skuId: row.sku.id,
+      name: row.sku.name,
+      brand: row.sku.brand,
+      category: row.sku.category,
+      price: Number(row.priceOverride ?? row.sku.basePrice).toFixed(2),
+      compareAtPrice:
+        row.sku.compareAtPrice == null ? null : Number(row.sku.compareAtPrice).toFixed(2),
+      unitOfMeasure: row.sku.unitOfMeasure,
+      images: Array.isArray(row.sku.images) ? row.sku.images : [],
+      description: row.sku.description,
+      availableQty: row.snapshot?.availableQty ?? 0,
     };
   }
 
   private async assertStoreActive(storeId: string) {
-    const [store] = await db.select({ status: stores.status }).from(stores).where(eq(stores.id, storeId)).limit(1);
+    const store = await prisma.store.findUnique({
+      where: { id: storeId },
+      select: { status: true },
+    });
     if (!store || store.status !== "active") {
       throw new AppError(404, "Store not found", "NOT_FOUND");
     }
