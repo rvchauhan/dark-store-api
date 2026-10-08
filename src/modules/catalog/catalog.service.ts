@@ -5,6 +5,7 @@ import { asUniqueViolation, uniqueHit } from "../../db/prisma-helpers.js";
 import { AppError } from "../../shared/errors/app-error.js";
 import type { AuthUser } from "../../shared/types/auth.js";
 import type { CreateSkuInput, ListSkusQuery, UpdateSkuInput } from "./catalog.schemas.js";
+import { syncService } from "../sync/sync.service.js";
 
 /**
  * Catalog module service — owns master_catalog CRUD.
@@ -67,6 +68,9 @@ export class CatalogService {
         });
 
         // MVP "event": sku.created — in-process only until we add a message bus
+        syncService.syncProduct(sku.id).catch((err) => {
+          console.error(`[SHOPIFY_SYNC] Product create failed for ${sku.id}:`, err);
+        });
         return sku;
       } catch (err: unknown) {
         const violation = asUniqueViolation(err);
@@ -118,10 +122,26 @@ export class CatalogService {
         ...(input.status !== undefined ? { status: input.status } : {}),
       };
 
-      return await prisma.masterCatalog.update({
+      const updated = await prisma.masterCatalog.update({
         where: { id: skuId },
         data,
       });
+
+      // Soft-deleted SKUs must not stay listed on stores (bulk assign rejects archived),
+      // and must leave any open customer carts so checkout doesn't fail on ghosts.
+      if (input.status === "archived") {
+        await prisma.storeSkuMapping.updateMany({
+          where: { skuId },
+          data: { isListed: false },
+        });
+        await prisma.cartItem.deleteMany({ where: { skuId } });
+      }
+
+      syncService.syncProduct(updated.id).catch((err) => {
+        console.error(`[SHOPIFY_SYNC] Product update failed for ${updated.id}:`, err);
+      });
+
+      return updated;
     } catch (err: unknown) {
       const violation = asUniqueViolation(err);
       if (violation) {
@@ -196,6 +216,31 @@ export class CatalogService {
       brands: brandRows.map((r) => r.brand).filter((v): v is string => !!v),
       categories: categoryRows.map((r) => r.category).filter((v): v is string => !!v),
     };
+  }
+
+  /** Push every active/draft SKU in the tenant catalog to the linked Shopify store. */
+  async syncAllToShopify(auth: AuthUser) {
+    const skus = await prisma.masterCatalog.findMany({
+      where: { businessId: auth.businessId, status: { not: "archived" } },
+      select: { id: true },
+    });
+
+    let synced = 0;
+    const failures: Array<{ skuId: string; error: string }> = [];
+
+    for (const { id } of skus) {
+      try {
+        await syncService.syncProduct(id);
+        synced += 1;
+      } catch (err) {
+        failures.push({
+          skuId: id,
+          error: err instanceof Error ? err.message : "Unknown error",
+        });
+      }
+    }
+
+    return { total: skus.length, synced, failures };
   }
 }
 

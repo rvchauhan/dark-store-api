@@ -87,7 +87,7 @@ enum OrderStatus {
   confirmed
   preparing
   out_for_delivery
-  delivered
+  fulfilled
   cancelled
 
   @@map("order_status")
@@ -102,13 +102,70 @@ model Business {
   name      String
   createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  users         User[]
-  catalog       MasterCatalog[]
-  stores        Store[]
-  notifications Notification[]
-  orders        Order[]
+  users               User[]
+  catalog             MasterCatalog[]
+  stores              Store[]
+  notifications       Notification[]
+  orders              Order[]
+  partnerKeys         PartnerKey[]
+  externalInstallations ExternalInstallation[]
 
   @@map("businesses")
+}
+
+/**
+ * Machine-to-machine credential.
+ *
+ * - businessId set  → organization key (acts as business_admin for that tenant)
+ * - businessId null → platform key (Shopify app env) used only to provision merchants
+ *
+ * The raw key is shown once at creation and never persisted — only its
+ * SHA-256 hash is stored, so a database leak yields no usable credentials.
+ */
+model PartnerKey {
+  id         String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /** null = platform provisioning key (not tied to one merchant). */
+  businessId String?   @map("business_id") @db.Uuid
+  name       String
+  /** Non-secret leading segment, kept in plaintext so a key is identifiable in listings. */
+  keyPrefix  String    @map("key_prefix")
+  keyHash    String    @unique @map("key_hash")
+  scopes     String[]  @default(["read", "write"])
+  lastUsedAt DateTime? @map("last_used_at") @db.Timestamptz(6)
+  expiresAt  DateTime? @map("expires_at") @db.Timestamptz(6)
+  revokedAt  DateTime? @map("revoked_at") @db.Timestamptz(6)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  business Business? @relation(fields: [businessId], references: [id])
+
+  @@index([businessId], map: "idx_partner_keys_business")
+  @@map("partner_keys")
+}
+
+/**
+ * Maps an external site/store install (Shopify shop, custom site, …) to a Business.
+ * Idempotency key is (provider, externalId) — reinstall must not create a second tenant.
+ */
+model ExternalInstallation {
+  id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  businessId   String    @map("business_id") @db.Uuid
+  /** e.g. "shopify", "custom" */
+  provider     String
+  /** Unique external identity — Shopify shop domain, site id, org slug, etc. */
+  externalId   String    @map("external_id")
+  /** Optional display name from the external system. */
+  displayName  String?   @map("display_name")
+  metadata     Json      @default("{}")
+  installedAt  DateTime  @default(now()) @map("installed_at") @db.Timestamptz(6)
+  uninstalledAt DateTime? @map("uninstalled_at") @db.Timestamptz(6)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  business Business @relation(fields: [businessId], references: [id])
+
+  @@unique([provider, externalId], map: "external_installations_provider_external_unique")
+  @@index([businessId], map: "idx_external_installations_business")
+  @@map("external_installations")
 }
 
 model User {
@@ -199,6 +256,10 @@ model MasterCatalog {
   variantOptions       Json          @default("[]") @map("variant_options")
   variants             Json          @default("[]")
   status               CatalogStatus @default(draft)
+  /** Shopify Admin product GID, e.g. gid://shopify/Product/123 */
+  shopifyProductId     String?       @map("shopify_product_id")
+  /** Shopify variant GID for the default variant */
+  shopifyVariantId     String?       @map("shopify_variant_id")
   createdAt            DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt            DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
@@ -363,6 +424,10 @@ model Order {
   trackingName    String?     @map("tracking_name")
   trackingNumber  String?     @map("tracking_number")
   trackingUrl     String?     @map("tracking_url")
+  /** Shopify Admin order GID */
+  shopifyOrderId  String?     @map("shopify_order_id")
+  /** Merchant-facing order name from Shopify, e.g. #1118 */
+  orderNumber     String?     @map("order_number")
   createdAt       DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt       DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 

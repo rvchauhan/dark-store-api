@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { storeService } from "./store.service.js";
+import { storeOrdersService } from "../store-orders/store-orders.service.js";
 import {
   bulkSkuMappingSchema,
   createStoreSchema,
@@ -7,6 +8,7 @@ import {
   updateSkuMappingSchema,
   updateStoreSchema,
 } from "./store.schemas.js";
+import { listNetworkOrdersQuerySchema } from "../store-orders/store-orders.schemas.js";
 import { asyncHandler } from "../../shared/middleware/error-handler.js";
 import { requireAuth } from "../../shared/middleware/auth.js";
 import { requireRoles, requireStoreAccess } from "../../shared/middleware/rbac.js";
@@ -67,6 +69,32 @@ storeRouter.get(
   asyncHandler(async (req, res) => {
     const stats = await storeService.getDashboardStats(req.auth!);
     res.json(stats);
+  }),
+);
+
+// Network-wide order supervision for Shopify / business admins.
+storeRouter.get(
+  "/network-orders",
+  requireRoles("business_admin"),
+  asyncHandler(async (req, res) => {
+    const parsed = listNetworkOrdersQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      throw new AppError(400, parsed.error.errors[0]?.message ?? "Invalid query", "VALIDATION_ERROR");
+    }
+    const data = await storeOrdersService.listNetworkOrders(req.auth!, parsed.data);
+    res.json({ data });
+  }),
+);
+
+storeRouter.get(
+  "/network-orders/:orderId",
+  requireRoles("business_admin"),
+  asyncHandler(async (req, res) => {
+    const result = await storeOrdersService.getNetworkOrder(
+      req.auth!,
+      routeParam(req.params.orderId, "orderId"),
+    );
+    res.json(result);
   }),
 );
 

@@ -14,7 +14,10 @@ export class CartService {
   async getCart(customerId: string) {
     const cart = await this.findCart(customerId);
     if (!cart) return { cartId: null, storeId: null, items: [], itemsTotal: "0.00" };
-    return this.cartWithItems(cart);
+    await this.pruneUnavailableItems(cart.id, cart.storeId);
+    const refreshed = await this.findCart(customerId);
+    if (!refreshed) return { cartId: null, storeId: null, items: [], itemsTotal: "0.00" };
+    return this.cartWithItems(refreshed);
   }
 
   async addItem(customerId: string, input: AddCartItemInput) {
@@ -146,16 +149,57 @@ export class CartService {
       where: { storeId_skuId: { storeId, skuId } },
       include: {
         store: { select: { status: true } },
+        sku: { select: { name: true, status: true } },
         snapshot: { select: { availableQty: true } },
       },
     });
 
-    if (!row || !row.isListed || row.store.status !== "active") {
-      throw new AppError(404, "Product is not available", "NOT_FOUND");
+    if (!row || !row.isListed || row.store.status !== "active" || row.sku.status === "archived") {
+      const name = row?.sku.name ? ` (${row.sku.name})` : "";
+      throw new AppError(404, `Product is not available${name}`, "NOT_FOUND");
     }
 
     if ((row.snapshot?.availableQty ?? 0) < quantity) {
       throw new AppError(409, "Not enough stock available", "OUT_OF_STOCK");
+    }
+  }
+
+  /**
+   * Drop cart lines that can no longer be bought (unlisted / archived / inactive store).
+   * Deletes the cart entirely when nothing purchasable remains.
+   */
+  private async pruneUnavailableItems(cartId: string, storeId: string) {
+    const lines = await prisma.cartItem.findMany({
+      where: { cartId },
+      select: { skuId: true },
+    });
+    if (lines.length === 0) return;
+
+    const mappings = await prisma.storeSkuMapping.findMany({
+      where: { storeId, skuId: { in: lines.map((l) => l.skuId) } },
+      include: {
+        store: { select: { status: true } },
+        sku: { select: { status: true } },
+      },
+    });
+    const ok = new Set(
+      mappings
+        .filter(
+          (m) => m.isListed && m.store.status === "active" && m.sku.status !== "archived",
+        )
+        .map((m) => m.skuId),
+    );
+
+    const staleIds = lines.map((l) => l.skuId).filter((id) => !ok.has(id));
+    if (staleIds.length === 0) return;
+
+    await prisma.cartItem.deleteMany({
+      where: { cartId, skuId: { in: staleIds } },
+    });
+
+    const remaining = await prisma.cartItem.count({ where: { cartId } });
+    if (remaining === 0) {
+      await prisma.cart.delete({ where: { id: cartId } }).catch(() => undefined);
     }
   }
 }

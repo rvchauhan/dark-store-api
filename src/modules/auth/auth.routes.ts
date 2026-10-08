@@ -3,6 +3,7 @@ import { authService } from "./auth.service.js";
 import {
   acceptInviteSchema,
   changePasswordSchema,
+  checkManagerEmailSchema,
   googleAuthSchema,
   inviteManagerSchema,
   loginSchema,
@@ -81,6 +82,21 @@ authRouter.post(
 
     const result = await authService.inviteManager(req.auth!, parsed.data);
     res.status(201).json(result);
+  }),
+);
+
+authRouter.post(
+  "/check-manager-email",
+  requireAuth,
+  requireRoles("business_admin"),
+  asyncHandler(async (req, res) => {
+    const parsed = checkManagerEmailSchema.safeParse(req.body);
+    if (!parsed.success) {
+      throw new AppError(400, parsed.error.errors[0]?.message ?? "Invalid input", "VALIDATION_ERROR");
+    }
+
+    const result = await authService.checkManagerEmail(req.auth!, parsed.data);
+    res.json(result);
   }),
 );
 

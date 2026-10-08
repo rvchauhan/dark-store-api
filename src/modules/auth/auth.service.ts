@@ -7,9 +7,11 @@ import { AppError } from "../../shared/errors/app-error.js";
 import { signAccessToken } from "../../shared/auth/jwt.js";
 import { verifyGoogleIdToken } from "../../shared/auth/google.js";
 import { sendManagerInviteEmail } from "../../shared/email/email.service.js";
+import { requireUserId } from "../../shared/middleware/auth.js";
 import type {
   AcceptInviteInput,
   ChangePasswordInput,
+  CheckManagerEmailInput,
   GoogleAuthInput,
   InviteManagerInput,
   LoginInput,
@@ -184,10 +186,10 @@ export class AuthService {
 
     let user: User;
     if (existing) {
-      if (existing.businessId !== auth.businessId) {
-        throw new AppError(409, "An account with this email already exists", "EMAIL_TAKEN");
+      if (!this.canReinvite(existing, auth, input.storeId)) {
+        throw new AppError(409, "This email is already registered", "EMAIL_TAKEN");
       }
-      // Re-invite: reassign to this store and reset to invited (does not touch an active password).
+      // Re-invite the same store's pending manager: refresh name and issue a new token.
       user = await prisma.user.update({
         where: { id: existing.id },
         data: { name, storeId: input.storeId, role: "store_manager", status: "invited" },
@@ -232,6 +234,15 @@ export class AuthService {
     };
   }
 
+  /** Lets the wizard reject an already-registered manager email before creating the store. */
+  async checkManagerEmail(auth: AuthUser, input: CheckManagerEmailInput) {
+    const email = input.email.trim().toLowerCase();
+    const existing = await prisma.user.findUnique({ where: { email } });
+    const available =
+      !existing || (input.storeId ? this.canReinvite(existing, auth, input.storeId) : false);
+    return { available };
+  }
+
   /** Public — lets the set-password page greet the invitee before they submit. */
   async getInvite(rawToken: string) {
     const invite = await this.resolveInvite(rawToken);
@@ -266,7 +277,9 @@ export class AuthService {
 
   /** Self-serve password change for a logged-in user. */
   async changePassword(auth: AuthUser, input: ChangePasswordInput) {
-    const user = await prisma.user.findUnique({ where: { id: auth.userId } });
+    const userId = requireUserId(auth);
+
+    const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user) {
       throw new AppError(404, "User not found", "NOT_FOUND");
     }
@@ -286,7 +299,7 @@ export class AuthService {
 
     const passwordHash = await bcrypt.hash(input.newPassword, 10);
     await prisma.user.update({
-      where: { id: auth.userId },
+      where: { id: userId },
       data: { passwordHash },
     });
 
@@ -295,7 +308,7 @@ export class AuthService {
 
   async getNotificationPreferences(auth: AuthUser) {
     const user = await prisma.user.findUnique({
-      where: { id: auth.userId },
+      where: { id: requireUserId(auth) },
       select: { notificationPreferences: true },
     });
     if (!user) {
@@ -310,7 +323,7 @@ export class AuthService {
     const merged = { ...existing, ...input };
 
     const updated = await prisma.user.update({
-      where: { id: auth.userId },
+      where: { id: requireUserId(auth) },
       data: { notificationPreferences: merged },
       select: { notificationPreferences: true },
     });
@@ -321,6 +334,16 @@ export class AuthService {
   // -----------------------------------------------------------------------
   // Internals
   // -----------------------------------------------------------------------
+
+  /** Only a still-pending manager of this same store may be re-invited; any other existing account is taken. */
+  private canReinvite(existing: User, auth: AuthUser, storeId: string): boolean {
+    return (
+      existing.businessId === auth.businessId &&
+      existing.role === "store_manager" &&
+      existing.status === "invited" &&
+      existing.storeId === storeId
+    );
+  }
 
   private hashToken(rawToken: string): string {
     return createHash("sha256").update(rawToken).digest("hex");
@@ -336,6 +359,11 @@ export class AuthService {
     }
 
     return invite;
+  }
+
+  /** Issues a staff JWT for an existing user — used by login and partner provision. */
+  issueSessionForUser(user: User) {
+    return this.issueSession(user);
   }
 
   private issueSession(user: User) {

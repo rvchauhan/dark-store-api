@@ -74,6 +74,100 @@ Optional seed personas (only if you explicitly run `db:seed`):
 | admin@qcommerce.io  | abcd123  | business_admin |
 | manager@qcommerce.io| abcd123  | store_manager  |
 
+## Partner API keys
+
+Two kinds of machine credentials:
+
+| Kind | How to create | Where it lives | What it can do |
+|------|---------------|----------------|----------------|
+| **Platform key** | `--platform` | Shopify app **backend** `.env` as `PARTNER_API_KEY` | `/api/partner/provision`, `/session`, `/uninstall` |
+| **Organization key** | `--business <uuid>` | Partner ERP / reporting env | Catalog, stores, inventory, store orders, analytics, geo for that business |
+
+### Avoid CORS & key leaks (critical)
+
+```
+Shopify Admin (browser)
+        ↓
+Your Shopify app backend  ← PARTNER_API_KEY lives HERE only
+        ↓  server-to-server (no CORS)
+Dark Store API
+```
+
+- Never put `PARTNER_API_KEY` in the browser / embedded app frontend.
+- Browser (or embedded app UI) should call **your Shopify backend**, which then calls this API.
+- After provision/session, use the returned **JWT** (`Authorization: Bearer …`) for catalog/stores/orders.
+- If the embedded UI must call this API directly, add its origin to `CORS_ORIGIN` and use **JWT only** — still never the platform key.
+
+### 1. Create a platform key (Shopify app)
+
+```bash
+npm run partner-key:create -- --platform --name "Shopify App"
+```
+
+```bash
+PARTNER_API_KEY=dsk_test_...
+DARK_STORE_API_URL=http://localhost:3001
+```
+
+### 2. First install — provision (register + optional dark store + JWT)
+
+```bash
+curl -s -X POST http://localhost:3001/api/partner/provision \
+  -H "x-api-key: $PARTNER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "shopify",
+    "externalId": "acme.myshopify.com",
+    "organizationName": "Acme Retail",
+    "admin": {
+      "email": "owner@acme.com",
+      "name": "Acme Owner",
+      "password": "abcd1234"
+    },
+    "store": {
+      "name": "Acme Main Dark Store",
+      "address": "12 Main St"
+    }
+  }'
+```
+
+Returns `business`, optional `store`, `token` (JWT), `user`.
+
+Idempotent on `(provider, externalId)`.
+
+### 3. App open — session (login with shop domain)
+
+```bash
+curl -s -X POST http://localhost:3001/api/partner/session \
+  -H "x-api-key: $PARTNER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "shopify",
+    "externalId": "acme.myshopify.com"
+  }'
+```
+
+- `200` + JWT if already provisioned
+- `404 INSTALLATION_NOT_FOUND` → call `/provision` first
+
+### 4. Organization keys (optional ERP access)
+
+```bash
+npm run partner-key:create -- --business <business-uuid> --name "Acme ERP"
+```
+
+```bash
+curl -s http://localhost:3001/api/catalog/skus \
+  -H "x-api-key: dsk_live_xxxxxxxx"
+```
+
+| Aspect | Behaviour |
+|--------|-----------|
+| Key format | `dsk_<env>_<43-char base64url>` |
+| Platform key | Provisioning/session only |
+| Organization key | Acts as `business_admin` for one tenant |
+| Day-to-day after login | Use staff JWT, not the platform key |
+
 ## API examples
 
 ```bash

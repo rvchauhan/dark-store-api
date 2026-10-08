@@ -125,3 +125,12 @@ catalogRouter.patch(
     res.json(sku);
   }),
 );
+
+catalogRouter.post(
+  "/sync-shopify",
+  requireRoles("business_admin"),
+  asyncHandler(async (req, res) => {
+    const result = await catalogService.syncAllToShopify(req.auth!);
+    res.json(result);
+  }),
+);

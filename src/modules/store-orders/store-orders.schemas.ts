@@ -1,18 +1,27 @@
 import { z } from "zod";
+import { normalizeHttpUrl } from "../../shared/utils/http-url.js";
 
 /** Query for GET /api/stores/:storeId/orders */
 export const listOrdersQuerySchema = z.object({
-  status: z.enum(["active", "all"]).default("active"),
+  status: z.enum(["active", "all", "fulfilled"]).default("active"),
 });
 
 export type ListOrdersQuery = z.infer<typeof listOrdersQuerySchema>;
+
+/** Query for GET /api/stores/network-orders (business admin) */
+export const listNetworkOrdersQuerySchema = z.object({
+  status: z.enum(["active", "all", "fulfilled"]).default("all"),
+  storeId: z.string().uuid().optional(),
+});
+
+export type ListNetworkOrdersQuery = z.infer<typeof listNetworkOrdersQuerySchema>;
 
 const orderStatuses = [
   "placed",
   "confirmed",
   "preparing",
   "out_for_delivery",
-  "delivered",
+  "fulfilled",
   "cancelled",
 ] as const;
 
@@ -29,7 +38,18 @@ export const updateOrderStatusSchema = z.object({
   riderPhone: z.string().min(1).optional(),
   trackingName: z.string().min(1).optional(),
   trackingNumber: z.string().min(1).optional(),
-  trackingUrl: z.string().min(1).optional(),
+  trackingUrl: z
+    .string()
+    .min(1)
+    .transform((value, ctx) => {
+      const url = normalizeHttpUrl(value);
+      if (!url) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Enter a valid tracking URL" });
+        return z.NEVER;
+      }
+      return url;
+    })
+    .optional(),
 });
 
 export type UpdateOrderStatusInput = z.infer<typeof updateOrderStatusSchema>;

@@ -19,7 +19,12 @@
     "db:ensure-accounts": "tsx src/db/ensure-yopmail-accounts.ts",
     "db:setup": "npm run db:migrate",
     "db:reset": "docker compose down -v && docker compose up -d --wait && npm run db:setup",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "sync:fulfillments": "tsx src/scripts/sync-fulfillments.ts",
+    "partner-key": "tsx src/scripts/partner-key.ts",
+    "partner-key:create": "tsx src/scripts/partner-key.ts create",
+    "partner-key:list": "tsx src/scripts/partner-key.ts list",
+    "partner-key:revoke": "tsx src/scripts/partner-key.ts revoke"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",

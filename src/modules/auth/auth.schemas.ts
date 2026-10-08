@@ -33,6 +33,14 @@ export const inviteManagerSchema = z.object({
 
 export type InviteManagerInput = z.infer<typeof inviteManagerSchema>;
 
+/** POST /api/auth/check-manager-email — is this email free to invite as a store manager? */
+export const checkManagerEmailSchema = z.object({
+  email: z.string().email(),
+  storeId: z.string().uuid().optional(),
+});
+
+export type CheckManagerEmailInput = z.infer<typeof checkManagerEmailSchema>;
+
 /** POST /api/auth/accept-invite — invitee sets their own password */
 export const acceptInviteSchema = z.object({
   token: z.string().min(1),

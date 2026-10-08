@@ -8,6 +8,7 @@ import type {
   SkuInventoryQuery,
   StockInInput,
 } from "./inventory.schemas.js";
+import { syncService } from "../sync/sync.service.js";
 
 /**
  * Inventory module service — ledger writes + snapshot reads.
@@ -20,6 +21,15 @@ import type {
  *
  * Future split: `inventory-service` owns ledger + snapshot + notifications.
  */
+
+/**
+ * Ledger rows written by a partner key have no employee to point at, so the
+ * key's label is recorded in `source` to keep every movement attributable.
+ */
+function defaultLedgerSource(auth: AuthUser, type: string): string {
+  return auth.apiKey ? `api:${auth.apiKey.name}` : `manual_${type}`;
+}
+
 export class InventoryService {
   // -----------------------------------------------------------------------
   // Step 4 — Opening stock / restock
@@ -34,7 +44,9 @@ export class InventoryService {
       skuId: input.skuId,
       type: "stock_in",
       quantity: input.quantity,
-      source: input.source ?? "manual_stock_in",
+      // Left undefined so recordMovement applies the caller-aware default
+      // (it resolves to "manual_stock_in" for staff, as before).
+      source: input.source,
       referenceId: input.referenceId,
     });
   }
@@ -329,8 +341,10 @@ export class InventoryService {
           type: input.type,
           quantity: delta,
           referenceId: input.referenceId,
+          // null for partner keys — no person is behind a machine request, so
+          // attribution falls to `source` below.
           employeeId: auth.userId,
-          source: input.source ?? `manual_${input.type}`,
+          source: input.source ?? defaultLedgerSource(auth, input.type),
         },
       });
 
@@ -349,7 +363,12 @@ export class InventoryService {
         },
       });
 
-      // MVP "event": stock.updated
+      return ledgerRow;
+    }).then((ledgerRow) => {
+      // MVP "event": stock.updated → mirror aggregated qty to Shopify
+      syncService.syncInventory(input.skuId).catch((err) => {
+        console.error(`[SHOPIFY_SYNC] Inventory sync failed for ${input.skuId}:`, err);
+      });
       return ledgerRow;
     });
   }

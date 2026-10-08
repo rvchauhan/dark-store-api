@@ -1,6 +1,7 @@
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../db/client.js";
 import { AppError } from "../../shared/errors/app-error.js";
+import { syncService } from "../sync/sync.service.js";
 import type { CheckoutInput } from "./orders.schemas.js";
 
 const HANDLING_FEE = 2;
@@ -42,7 +43,10 @@ export class OrdersService {
       const skuIds = cartLines.map((l) => l.skuId);
       const mappings = await tx.storeSkuMapping.findMany({
         where: { storeId: cart.storeId, skuId: { in: skuIds } },
-        include: { snapshot: { select: { availableQty: true } } },
+        include: {
+          snapshot: { select: { availableQty: true } },
+          sku: { select: { status: true } },
+        },
       });
       const mappingBySku = new Map(mappings.map((m) => [m.skuId, m]));
 
@@ -55,6 +59,7 @@ export class OrdersService {
           basePrice: line.sku.basePrice,
           priceOverride: mapping?.priceOverride ?? null,
           isListed: mapping?.isListed ?? false,
+          skuStatus: mapping?.sku.status ?? "archived",
           storeStatus: store.status,
           businessId: store.businessId,
           availableQty: mapping?.snapshot?.availableQty ?? 0,
@@ -62,7 +67,7 @@ export class OrdersService {
       });
 
       for (const row of rows) {
-        if (!row.isListed || row.storeStatus !== "active") {
+        if (!row.isListed || row.storeStatus !== "active" || row.skuStatus === "archived") {
           throw new AppError(409, `${row.name} is no longer available`, "ITEM_UNAVAILABLE");
         }
         if (row.availableQty < row.quantity) {
@@ -130,6 +135,13 @@ export class OrdersService {
       await tx.cart.delete({ where: { id: cart.id } });
 
       return { order, items: lineItems };
+    }).then(async (result) => {
+      await syncService
+        .routeInternalOrder(result.order.id, result.order.businessId, result.items)
+        .catch((err) => console.error("[SHOPIFY_SYNC] Order sync failed:", err));
+
+      const refreshed = await prisma.order.findUnique({ where: { id: result.order.id } });
+      return { order: refreshed ?? result.order, items: result.items };
     });
   }
 

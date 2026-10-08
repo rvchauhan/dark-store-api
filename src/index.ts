@@ -52,7 +52,32 @@ app.get("/health", (_req, res) => {
 app.use("/uploads", express.static(UPLOADS_DIR));
 
 // Interactive API documentation — http://localhost:{PORT}/api-docs
-app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(openApiSpec as object));
+// Authorize once with PARTNER_API_KEY (x-api-key) and/or Bearer JWT; values persist across reloads.
+app.use(
+  "/api-docs",
+  swaggerUi.serve,
+  swaggerUi.setup(openApiSpec as object, {
+    customSiteTitle: "Dark Store API",
+    swaggerOptions: {
+      persistAuthorization: true,
+      displayRequestDuration: true,
+      tryItOutEnabled: true,
+      // Prefer partner key when both credentials are filled; drop empty Bearer.
+      // Types are erased at compile time; swagger-ui-express embeds the JS function in the browser.
+      requestInterceptor: (req: { headers?: Record<string, string | undefined> }) => {
+        const headers = req.headers || {};
+        const apiKey = headers["x-api-key"] || headers["X-Api-Key"];
+        const auth = headers.Authorization || headers.authorization;
+        if (apiKey && (!auth || auth === "Bearer" || auth === "Bearer " || auth === "Bearer undefined")) {
+          delete headers.Authorization;
+          delete headers.authorization;
+        }
+        req.headers = headers;
+        return req;
+      },
+    },
+  }),
+);
 
 // Mount all domain modules under /api/*
 registerModules(app);

@@ -19,6 +19,17 @@ const envSchema = z.object({
   EMAIL_FROM: z.string().default("Q-Commerce <onboarding@resend.dev>"),
   /** Portal origin used to build links inside emails (invite/setup links, etc.) */
   PORTAL_URL: z.string().default("http://localhost:8080"),
+  /**
+   * Public base URL for this API — used when pushing product image URLs to Shopify.
+   * e.g. http://localhost:3001 or your ngrok URL for dark-store-api.
+   */
+  PUBLIC_API_URL: z.string().url().optional(),
+  /**
+   * Operator secret guarding /api/admin/partner-keys. Optional — when unset the
+   * admin routes are disabled entirely, so a missing value can never mean
+   * "open to everyone". Issue keys via `npm run partner-key:create` instead.
+   */
+  ADMIN_API_SECRET: z.string().min(16).optional(),
 });
 
 export const env = envSchema.parse(process.env);

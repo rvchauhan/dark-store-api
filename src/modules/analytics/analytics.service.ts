@@ -79,7 +79,7 @@ export class AnalyticsService {
       SELECT avg(extract(epoch from (updated_at - created_at)) / 60)::text AS avg_minutes
       FROM orders
       WHERE business_id = ${businessId}::uuid
-        AND status = 'delivered'
+        AND status = 'fulfilled'
         AND created_at >= ${skuWindowSince}
     `);
 
